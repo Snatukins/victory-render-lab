@@ -19,8 +19,8 @@
 
 | Check | Progress | Evidence |
 | :--- | :--- | :--- |
-| **Opening milestones** | ![80%](https://img.shields.io/badge/Opening-80%25-brightgreen) | Boot, title card, visible character, and lit environment observed. Repeatable completion at the performance target is open. |
-| **World speed** | ![3.7%](https://img.shields.io/badge/FPS%20target-3.7%25-orange) | The last 17 logged samples had a median of **1.1 FPS** against a **30 FPS** development target. Range **0.2–3.0 FPS**. |
+| **Opening milestones** | ![Opening milestones, 80%](docs/progress/opening.svg) | Boot, title card, visible character, and lit environment observed. Repeatable completion at the performance target is open. |
+| **World speed** | ![World speed, 3.7% of target](docs/progress/world-speed.svg) | The last 17 logged samples had a median of **1.1 FPS** against a **30 FPS** development target. Range **0.2–3.0 FPS**. |
 | **Full story and feature coverage** | ![Unmeasured](https://img.shields.io/badge/coverage-unmeasured-lightgrey) | No local mission-by-mission or feature-by-feature audit has been completed. |
 | **Current shader coverage** | ![Unmeasured](https://img.shields.io/badge/coverage-unmeasured-lightgrey) | The integrated revision still needs a fresh shader census. |
 
