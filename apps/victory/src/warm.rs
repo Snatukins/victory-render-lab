@@ -60,6 +60,39 @@ fn record_completion(out: &mut impl Write, fingerprint: &str, key: &str, there: 
     Ok(())
 }
 
+/// Runs before the title starts its loading and rendering threads.
+pub(crate) fn prime_for_run(dir: &Path) -> Result<()> {
+    if !std::env::var_os("VICTORY_PRIME_PIPELINES").is_some_and(|value| value == "1") {
+        return Ok(());
+    }
+    let listed = std::fs::read_to_string(dir.join("warm-done.txt")).unwrap_or_default();
+    let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
+    if listed.is_empty() || early.is_empty() {
+        return Ok(());
+    }
+    let began = Instant::now();
+    let fingerprint = known::fingerprint();
+    let done = completed_keys(&listed, &fingerprint);
+    let bad_list = std::fs::read_to_string(dir.join("warm-bad.txt")).unwrap_or_default();
+    let bad = bad_keys(&bad_list, &fingerprint);
+    let early: HashSet<&str> = early.lines().collect();
+    let entries = known::warm_entries(dir);
+    let recipes: Vec<_> = entries.iter().enumerate().filter_map(|(index, entry)| {
+        let key = entry.key.as_str();
+        (!entry.skipped && done.contains(key) && early.contains(key) && !bad.contains(key))
+            .then_some(known::WarmRecipe { index, offset: entry.offset, key })
+    }).collect();
+    if recipes.is_empty() {
+        return Ok(());
+    }
+    let jobs = std::env::var("VICTORY_PIPELINE_WORKERS").ok()
+        .and_then(|value| value.trim().parse::<usize>().ok()).unwrap_or(3).clamp(1, 4);
+    tracing::info!(pipelines = recipes.len(), jobs, "preparing host pipelines before starting the title");
+    let ready = known::prime(dir, &recipes, jobs)?;
+    tracing::info!(ready, selected = recipes.len(), seconds = began.elapsed().as_secs_f64(), "host pipelines ready before starting the title");
+    Ok(())
+}
+
 pub fn run(
     jobs: Option<usize>,
     batch_size: Option<u16>,

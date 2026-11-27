@@ -1,4 +1,51 @@
-# Vice-Tay
+<div align="center">
+
+# VIctory Render Lab
+
+**An RTX 4060 development branch of Vice-Tay and VIctory**
+
+![Experimental renderer](https://img.shields.io/badge/status-experimental-orange)
+![Windows D3D12](https://img.shields.io/badge/Windows-Direct3D%2012-blue)
+![RTX 4060](https://img.shields.io/badge/local%20test-RTX%204060-76B900)
+![GPLv3](https://img.shields.io/badge/license-GPLv3-purple)
+
+[Local scorecard](#local-validation-scorecard) · [Engineering](#engineering) · [Credits](#credits) · [Setup](#getting-started)
+
+</div>
+
+> [!IMPORTANT]
+> This is an independent compatibility-layer development branch. See the [asset policy](docs/asset-policy.md) for what belongs in the repository.
+
+## Local validation scorecard
+
+The November 27 RTX 4060 run used the Series S profile, DLSS Quality, a 1920×1080 window cap, a 40 ms texture staging budget, and the launcher’s shader-skip profile. The final capture shows a presented story scene with the character, hair, nearby figures, interior surfaces, and a lit outdoor background. Earlier testing showed some of that geometry in intermediate buffers while the presented output was black.
+
+| Area | Result | Scope |
+| --- | --- | --- |
+| Opening checklist | **4 / 5 · 80%** | Boot, title card, visible character, and lit environment were observed. Repeatable completion of the opening at the performance target remains unverified. |
+| Local rendered speed | **1.1 FPS median · 3.7% of 30 FPS** | Median of the final 17 reported FPS samples, not a frame-weighted benchmark. Samples span 0.2–3.0 FPS, or 0.7–10.0% of the target. |
+| DXIL validation | **25,523 / 26,084 · 97.8%** | Historical sweep on the earlier local translator. It recovered 1,602 validation passes. The integration revision needs a fresh census. |
+| Wave64 pipeline probe | **6 / 8 · 75%** | An isolated upstream test created six previously rejected compute pipelines on wave32 hardware. The eight were a targeted sample. |
+| Xbox build coverage | **Unmeasured** | No complete inventory of missions and features has been tested locally. |
+
+The 30 FPS figure is a development target. The upstream RTX 4090 results below describe different hardware and revisions.
+
+## Engineering
+
+- **Renderer.** Integrated the Vice-Tay runtime, including streamed texture notifications, packed-color presentation, and pipeline preparation for head blend shapes.
+- **RTX 4060 launcher.** Added a low-memory profile and default recording and warm-up of used D3D12 pipelines. The current working tree also adds optional pipeline priming on the title's D3D12 device. Priming trades startup time and memory for readiness during rendering.
+- **Earlier compatibility work.** Added descriptor heap bounds checks, corrected DXIL metadata for graphics UAVs and compute derivatives, and added reuse of matching cached pipelines.
+- **Testing.** Render-target captures pinpointed frames where geometry was present and the displayed image was black. Offline D3D12 testing identified a wave-size mismatch on the RTX 4060. Flight through the opening still shows dropped indirect work, long frame times, and variable pipeline readiness.
+
+## Credits
+
+- **Snatukins** drove the local RTX 4060 test effort, checked what actually appeared on screen, and directed the later integration and performance experiments.
+- **Codex-assisted local development** covered descriptor bounds, shader metadata, render-target diagnostics, and RTX 4060 launcher and pipeline-cache integration. The recent priming edits are uncommitted and have no individual Git author recorded.
+- **Marvisak and VIctory contributors** built the compatibility layer this branch extends.
+- **Taynan Piza / TaynanGT and Vice-Tay contributors** developed the runtime used as the renderer baseline, including tracked texture updates and pipeline warm-up changes. **Maxime Cambou** contributed NVIDIA profile tuning and reduced CPU waits for compatible fills.
+- The source history retains the original authors and contributors. See [LICENSE](LICENSE) for GPLv3 terms.
+
+## Upstream Vice-Tay documentation
 
 **Xbox Series compatibility on Windows, tuned on a GeForce RTX 4090.**
 
@@ -137,6 +184,10 @@ pipelines before starting the game and record newly encountered pipelines.
 The first run with this option records the pipeline descriptions for the
 next launch. The descriptions stay in the local cache. The RTX 4060 profile
 enables this by default. Pass `-WarmPipelines:$false` to skip it for one run.
+
+`-PrimePipelines` also creates those warmed pipelines on the game's D3D12
+device before the title starts. This adds startup time and keeps the prepared
+pipelines in memory for the run.
 
 When comparing warm-up times, `warm --used --batch-size 80` tests longer batches and
 `warm --used --normal-priority` tests normal worker priority. The defaults are

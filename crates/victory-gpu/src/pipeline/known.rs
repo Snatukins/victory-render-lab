@@ -340,6 +340,34 @@ fn requested_pipelines(dir: &Path, which: &[WarmRecipe<'_>]) -> io::Result<Vec<V
 pub fn make(
     dir: &Path, which: &[WarmRecipe<'_>], mut each: impl FnMut(usize, Option<(f64, bool)>),
 ) -> io::Result<()> {
+    with_recipes(dir, which, |recipe, shaders, graphics| {
+        each(recipe.index, None);
+        let began = std::time::Instant::now();
+        let made = HostPipeline::new(&shaders, graphics.as_deref()).is_some();
+        each(recipe.index, Some((began.elapsed().as_secs_f64() * 1e3, made)));
+        Ok(())
+    })
+}
+
+/// Prepare previously warmed pipelines on the device that will render them.
+pub fn prime(dir: &Path, which: &[WarmRecipe<'_>], jobs: usize) -> io::Result<usize> {
+    let mut pipelines = Vec::with_capacity(which.len());
+    with_recipes(dir, which, |recipe, shaders, graphics| {
+        let pipeline = super::make::Pending::new(shaders, graphics);
+        if pipeline.key() != recipe.key {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pipeline recipe no longer matches its key"));
+        }
+        pipelines.push(pipeline);
+        Ok(())
+    })?;
+    Ok(super::make::prime(pipelines, jobs))
+}
+
+fn with_recipes(
+    dir: &Path,
+    which: &[WarmRecipe<'_>],
+    mut visit: impl FnMut(&WarmRecipe<'_>, Vec<Arc<Shader>>, Option<Box<GraphicsState>>) -> io::Result<()>,
+) -> io::Result<()> {
     let entries = requested_pipelines(dir, which)?;
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| {
@@ -354,16 +382,13 @@ pub fn make(
         Some(bytes)
     };
     for (recipe, entry) in which.iter().zip(&entries) {
-        let began = std::time::Instant::now();
         let (shaders, graphics) = parse(entry, &mut read).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("pipeline recipe {} ({}) or its shader data is incomplete or invalid", recipe.index, recipe.key),
             )
         })?;
-        each(recipe.index, None);
-        let made = HostPipeline::new(&shaders, graphics.as_deref()).is_some();
-        each(recipe.index, Some((began.elapsed().as_secs_f64() * 1e3, made)));
+        visit(recipe, shaders, graphics)?;
     }
     Ok(())
 }

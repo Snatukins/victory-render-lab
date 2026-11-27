@@ -21,9 +21,9 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Option<Arc<HostPipeline>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -52,6 +52,33 @@ pub(crate) struct Pending {
     wait_for_head_map: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+}
+
+/// Pipelines made before the title entered, on its own D3D12 device.
+static PRIMED: OnceLock<HashMap<String, Arc<HostPipeline>>> = OnceLock::new();
+
+pub(super) fn prime(pipelines: Vec<Pending>, jobs: usize) -> usize {
+    let primed = PRIMED.get_or_init(|| {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let work = || {
+                while let Some(pipeline) = pipelines.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    if pipeline.left_out.is_none() {
+                        pipeline.make();
+                    }
+                }
+            };
+            for _ in 1..jobs.min(pipelines.len()) {
+                scope.spawn(work);
+            }
+            work();
+        });
+        pipelines
+            .into_iter()
+            .filter_map(|p| Some((p.key, p.made.into_inner()??)))
+            .collect()
+    });
+    primed.len()
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -146,6 +173,13 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders, skip_hashes);
+        let key = key.finalize().to_hex()[..32].to_owned();
+        let made = OnceLock::new();
+        if left_out.is_none()
+            && let Some(pipeline) = PRIMED.get().and_then(|primed| primed.get(&key))
+        {
+            let _ = made.set(Some(pipeline.clone()));
+        }
         Pending {
             screen,
             scene_input,
@@ -156,8 +190,8 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
-            made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            made,
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -178,7 +212,7 @@ impl Pending {
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         self.made.get_or_init(|| match catch_unwind(AssertUnwindSafe(build)) {
-            Ok(pipeline) => pipeline,
+            Ok(pipeline) => pipeline.map(Arc::new),
             Err(_) => {
                 tracing::warn!(key = self.key, shaders = ?self.shaders, "host pipeline build panicked");
                 None
@@ -254,7 +288,7 @@ impl HeadMapWait {
         Self { allowance, timed_out: AtomicBool::new(false) }
     }
 
-    fn wait<'a>(&self, pipeline: &'a Pending) -> Option<&'a Option<HostPipeline>> {
+    fn wait<'a>(&self, pipeline: &'a Pending) -> Option<&'a Option<Arc<HostPipeline>>> {
         if self.timed_out.load(Ordering::Acquire) {
             return pipeline.made.get();
         }
@@ -347,7 +381,7 @@ fn ready_with<'a>(
             p.made.get()
         };
     }
-    let host_pipeline = made.and_then(Option::as_ref);
+    let host_pipeline = made.and_then(Option::as_deref);
     if let Some((frame, began)) = began {
         tracing::info!(
             frame,
@@ -376,7 +410,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// run drew with it (during loading, so the world's first frames find it),
 /// or if it is a confirmed opening-scene / bake producer.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_some() {
+    if p.left_out.is_some() || p.made.get().is_some() {
         return;
     }
     if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {

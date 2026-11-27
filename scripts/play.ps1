@@ -6,6 +6,7 @@
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
 # -WarmPipelines compile previously used pipelines before launching and record new ones (on for 4060)
+# -PrimePipelines create warmed pipelines in the game process before its loading threads start
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -FrameGen     AMD frame generation
 # -Fsr / -Dlss  PC upscaling in Series S (quality, balanced or performance)
@@ -32,6 +33,7 @@ param(
     [switch]$NoPanel,
     [switch]$SkipShaders,
     [switch]$WarmPipelines,
+    [switch]$PrimePipelines,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$FrameGen,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr,
@@ -250,6 +252,7 @@ if (-not $Windowed) { $settings.VICTORY_FULLSCREEN = '1' }
 if (-not $NoPanel) { $settings.VICTORY_PANEL = '1' }
 if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1' }
 if ($WarmPipelines) { $settings.VICTORY_PIPELINE_BOOK = '1' }
+if ($PrimePipelines) { $settings.VICTORY_PRIME_PIPELINES = '1' }
 if ($Fsr -or $Dlss) { $settings.Remove('VICTORY_UPSCALER') }
 if ($Fsr) { $settings.VICTORY_FSR = $Fsr.ToLowerInvariant() }
 if ($Dlss) { $settings.VICTORY_DLSS = $Dlss.ToLowerInvariant() }

@@ -186,7 +186,8 @@ pub fn run(
     }
 
     let images = cfg.cache_subdir("images")?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let shaders = cfg.cache_subdir("shaders")?;
+    victory_hle::modules::d3d12x::use_shader_cache(shaders.clone());
     // A 4K profile renders smaller and has a host upscaler (DLSS first
     // when asked, else FSR) fill the 3840x2160 output; without a host
     // upscaler the stock profile runs.
@@ -377,6 +378,9 @@ pub fn run(
             let copies = done.iter().filter(|d| **d == Hooked::Done).count();
             println!("renderer port 2: {copies} of {} table copies of the title patched", done.len());
         }
+    }
+    if execute && let Err(error) = crate::warm::prime_for_run(&shaders.with_file_name("pipelines")) {
+        tracing::warn!(%error, "could not prepare pipelines before starting the title");
     }
     // A ceiling on the working set (VICTORY_WORKING_SET_MB, off without it),
     // before the title touches its memory.
