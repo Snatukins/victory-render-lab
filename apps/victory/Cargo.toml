@@ -12,7 +12,6 @@ victory-core.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
-victory-gpu.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 anyhow.workspace = true
@@ -21,6 +20,9 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
@@ -31,6 +33,7 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true

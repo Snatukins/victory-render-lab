@@ -17,267 +17,6 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
-/// Populate the shared heap ABI's reserved tail with compatible descriptors.
-///
-/// # Safety
-/// The heap must belong to device and its tail must be exclusively reserved.
-/// No GPU work may be using the tail while these descriptors are written.
-pub unsafe fn make_heap_nulls(
-    device: &ID3D12Device,
-    heap: &ID3D12DescriptorHeap,
-    base: u32,
-    sampler: bool,
-) {
-    // SAFETY: the caller owns the reserved slots.
-    unsafe {
-        let kind = if sampler {
-            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
-        } else {
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
-        };
-        let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-        let step = device.GetDescriptorHandleIncrementSize(kind) as usize;
-        let at = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: start + (base + slot) as usize * step,
-        };
-        if sampler {
-            for (slot, filter) in [
-                D3D12_FILTER_MIN_MAG_MIP_POINT,
-                D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                device.CreateSampler(
-                    &D3D12_SAMPLER_DESC {
-                        Filter: filter,
-                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        MaxAnisotropy: 1,
-                        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-                        ..Default::default()
-                    },
-                    at(slot as u32),
-                );
-            }
-            return;
-        }
-        for slot in 0..super::NULL_VIEWS {
-            let (access, data) = super::null_view_properties(slot);
-            let kind = access & 0xff;
-            if kind == 13 {
-                device.CreateConstantBufferView(None, at(slot));
-                continue;
-            }
-            let format = match (kind, data) {
-                (11, _) => DXGI_FORMAT_R32_TYPELESS,
-                (12, _) => DXGI_FORMAT_UNKNOWN,
-                (_, 4) => DXGI_FORMAT_R32_SINT,
-                (_, 5) => DXGI_FORMAT_R32_UINT,
-                _ => DXGI_FORMAT_R32_FLOAT,
-            };
-            if access & 0x1000 != 0 {
-                let (dim, fields) = match kind {
-                    1 => (
-                        D3D12_UAV_DIMENSION_TEXTURE1D,
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Texture1D: D3D12_TEX1D_UAV::default(),
-                        },
-                    ),
-                    2 => (
-                        D3D12_UAV_DIMENSION_TEXTURE2D,
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Texture2D: D3D12_TEX2D_UAV::default(),
-                        },
-                    ),
-                    4 => (
-                        D3D12_UAV_DIMENSION_TEXTURE3D,
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Texture3D: D3D12_TEX3D_UAV {
-                                WSize: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    6 => (
-                        D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
-                                ArraySize: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    7 => (
-                        D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
-                                ArraySize: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    _ => (
-                        D3D12_UAV_DIMENSION_BUFFER,
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Buffer: D3D12_BUFFER_UAV {
-                                NumElements: 1,
-                                StructureByteStride: if kind == 12 { data } else { 0 },
-                                Flags: if kind == 11 {
-                                    D3D12_BUFFER_UAV_FLAG_RAW
-                                } else {
-                                    D3D12_BUFFER_UAV_FLAG_NONE
-                                },
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                };
-                device.CreateUnorderedAccessView(
-                    None,
-                    None,
-                    Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                        Format: format,
-                        ViewDimension: dim,
-                        Anonymous: fields,
-                    }),
-                    at(slot),
-                );
-            } else {
-                let (dim, fields) = match kind {
-                    1 => (
-                        D3D12_SRV_DIMENSION_TEXTURE1D,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture1D: D3D12_TEX1D_SRV {
-                                MipLevels: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    2 => (
-                        D3D12_SRV_DIMENSION_TEXTURE2D,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture2D: D3D12_TEX2D_SRV {
-                                MipLevels: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    3 => (
-                        D3D12_SRV_DIMENSION_TEXTURE2DMS,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture2DMS: D3D12_TEX2DMS_SRV::default(),
-                        },
-                    ),
-                    4 => (
-                        D3D12_SRV_DIMENSION_TEXTURE3D,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture3D: D3D12_TEX3D_SRV {
-                                MipLevels: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    5 => (
-                        D3D12_SRV_DIMENSION_TEXTURECUBE,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            TextureCube: D3D12_TEXCUBE_SRV {
-                                MipLevels: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    6 => (
-                        D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture1DArray: D3D12_TEX1D_ARRAY_SRV {
-                                MipLevels: 1,
-                                ArraySize: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    7 => (
-                        D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
-                                MipLevels: 1,
-                                ArraySize: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    8 => (
-                        D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV {
-                                ArraySize: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    9 => (
-                        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
-                                MipLevels: 1,
-                                NumCubes: 1,
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                    _ => (
-                        D3D12_SRV_DIMENSION_BUFFER,
-                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Buffer: D3D12_BUFFER_SRV {
-                                NumElements: 1,
-                                StructureByteStride: if kind == 12 { data } else { 0 },
-                                Flags: if kind == 11 {
-                                    D3D12_BUFFER_SRV_FLAG_RAW
-                                } else {
-                                    D3D12_BUFFER_SRV_FLAG_NONE
-                                },
-                                ..Default::default()
-                            },
-                        },
-                    ),
-                };
-                device.CreateShaderResourceView(
-                    None,
-                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: format,
-                        ViewDimension: dim,
-                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                        Anonymous: fields,
-                    }),
-                    at(slot),
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-const HEAP_BOUNDS_PARAM: windows::core::GUID =
-    windows::core::GUID::from_u128(0x481c3a0f_fc1b_4485_a146_d220c56aef5a);
-
-#[cfg(test)]
-fn bounds_parameter(root: &ID3D12RootSignature) -> Option<u32> {
-    let mut param = 0u32;
-    let mut bytes = size_of::<u32>() as u32;
-    // SAFETY: these output pointers cover the four bytes requested.
-    unsafe {
-        root.GetPrivateData(
-            &HEAP_BOUNDS_PARAM,
-            &mut bytes,
-            Some((&raw mut param).cast()),
-        )
-    }
-    .ok()
-    .map(|_| param)
-}
-
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -323,71 +62,209 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-/// The first adapter that is a GPU: not flagged software, and with video
-/// memory of its own. A machine without one (GitHub's Windows runner has only
-/// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
-/// checks on, and CI proved that the flag of adapter 0 alone is not enough:
-/// the runner's default adapter is not flagged software and its device still
-/// refuses a wave of 32
-/// (`permutes_read_the_lane_named_and_zero_from_lanes_left_out`). WARP and the
-/// basic render driver report no dedicated video memory, which is what this
-/// asks for as well.
-fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
-    // SAFETY: plain DXGI adapter enumeration.
+fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
+    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+        || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+}
+
+fn adapter_matches(requested: &str, index: u32, name: &str) -> bool {
+    if let Ok(wanted) = requested.parse::<u32>() {
+        wanted == index
+    } else {
+        !requested.is_empty() && name.to_lowercase().contains(&requested.to_lowercase())
+    }
+}
+
+fn adapter_desc(device: &ID3D12Device) -> windows::core::Result<DXGI_ADAPTER_DESC1> {
+    // SAFETY: plain adapter queries for a live device.
     unsafe {
-        for index in 0.. {
-            let Ok(adapter) = factory.EnumAdapters1(index) else {
-                break;
-            };
-            let desc = adapter.GetDesc1()?;
-            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
-            if !software && desc.DedicatedVideoMemory > 0 {
-                return Ok(adapter);
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        factory
+            .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())?
+            .GetDesc1()
+    }
+}
+
+fn shader_model(device: &ID3D12Device) -> windows::core::Result<D3D_SHADER_MODEL> {
+    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: a feature structure of the requested type and size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut sm).cast(),
+            size_of_val(&sm) as u32,
+        )?;
+    }
+    Ok(sm.HighestShaderModel)
+}
+
+/// Create the device used by the runtime and offline pipeline checks.
+/// An explicit DXGI index or name in `VICTORY_D3D12_ADAPTER` takes priority.
+/// Otherwise prefer a high-performance SM 6.6 adapter, then try DXGI's
+/// default if there is no suitable enumerated adapter.
+pub fn create_preferred_device() -> windows::core::Result<ID3D12Device> {
+    let requested = std::env::var("VICTORY_D3D12_ADAPTER").unwrap_or_default();
+    let requested = requested.trim();
+    // SAFETY: plain adapter queries and device creation.
+    unsafe {
+        let create = |adapter: Option<&IDXGIAdapter1>| -> windows::core::Result<ID3D12Device> {
+            let mut device = None;
+            match adapter {
+                Some(adapter) => D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
+            device.ok_or_else(windows::core::Error::empty)
+        };
+        if !requested.is_empty() {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            for index in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(index) else {
+                    break;
+                };
+                let desc = adapter.GetDesc1()?;
+                let name = String::from_utf16_lossy(&desc.Description);
+                if !software(&desc) && adapter_matches(requested, index, name.trim_end_matches('\0'))
+                {
+                    return create(Some(&adapter));
+                }
+            }
+            return Err(windows::core::Error::new(
+                DXGI_ERROR_NOT_FOUND,
+                format!("VICTORY_D3D12_ADAPTER={requested} matched no hardware adapter"),
+            ));
+        }
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            for index in 0.. {
+                let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                    index,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                ) else {
+                    break;
+                };
+                if adapter.GetDesc1().is_ok_and(|desc| !software(&desc))
+                    && let Ok(device) = create(Some(&adapter))
+                    && shader_model(&device).is_ok_and(|sm| sm.0 >= D3D_SHADER_MODEL_6_6.0)
+                {
+                    return Ok(device);
+                }
             }
         }
+        create(None)
     }
-    Err(windows::core::Error::new(
-        windows::Win32::Foundation::E_FAIL,
-        "no hardware adapter",
-    ))
+}
+
+#[cfg(test)]
+#[test]
+fn an_explicit_adapter_matches_an_index_or_name() {
+    let nvidia = "NVIDIA GeForce RTX 3050 Laptop GPU";
+    let integrated = "Intel(R) UHD Graphics";
+    assert!(adapter_matches("1", 1, nvidia));
+    assert!(!adapter_matches("1", 0, integrated));
+    assert!(adapter_matches("geforce rtx 3050", 1, nvidia));
+    assert!(!adapter_matches("nvidia", 0, integrated));
+    assert!(!adapter_matches("", 0, integrated));
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
-    /// A software default adapter (a machine without a GPU, as CI) is
-    /// refused, so hardware-only checks never run on WARP.
+    #[cfg(test)]
+    pub(super) fn check_hardware_validation(&self) {
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_none() {
+            return;
+        }
+        let queue: ID3D12InfoQueue = self.device.cast().expect("D3D12 debug layer");
+        let (mut errors, mut warnings) = (0, 0);
+        // SAFETY: storage is aligned for the message and sized for its inline text.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                queue.GetMessage(i, None, &mut size).unwrap();
+                let mut storage = vec![0u64; size.div_ceil(8)];
+                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                queue.GetMessage(i, Some(message), &mut size).unwrap();
+                let message = &*message;
+                if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                    let text = std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                    eprintln!("D3D12 #{}: {}", message.ID.0, String::from_utf8_lossy(text).trim_end_matches('\0'));
+                    if message.Severity == D3D12_MESSAGE_SEVERITY_WARNING { warnings += 1 } else { errors += 1 }
+                }
+            }
+            assert_eq!(queue.GetNumMessagesDiscardedByMessageCountLimit(), 0);
+        }
+        eprintln!("D3D12 hardware validation: {errors} errors, {warnings} warnings");
+        assert_eq!(errors, 0);
+    }
+
+    /// The preferred hardware adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
+            // refused pipeline's error then carries.
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                let mut debug: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut debug).is_ok()
+                    && let Some(debug) = debug
+                {
+                    debug.EnableDebugLayer();
+                    #[cfg(test)]
+                    if !warp && std::env::var_os("VICTORY_NVIDIA_HARDWARE_TESTS").is_some_and(|v| v == "1") {
+                        debug.cast::<ID3D12Debug1>().expect("GPU validation interface").SetEnableGPUBasedValidation(true);
+                    }
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
-            let factory: IDXGIFactory4 =
-                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            let adapter: IDXGIAdapter1 = if warp {
-                factory.EnumWarpAdapter().map_err(err)?
+            if warp {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                hardware_adapter(&factory).map_err(err)?
-            };
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                let hardware = create_preferred_device().map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if adapter_desc(&hardware).is_ok_and(|desc| software(&desc)) {
+                    return Err("the default device is the software adapter".to_owned());
+                }
+                device = Some(hardware);
+            }
             let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
+            let sm = shader_model(&device).map_err(err)?;
+            if sm.0 < D3D_SHADER_MODEL_6_6.0 {
+                return Err(format!("the device supports SM {:#x} only", sm.0));
             }
             Ok(Host { device })
         }
+    }
+
+    /// The name of the adapter that actually created the device.
+    pub fn adapter_name(&self) -> Option<String> {
+        let desc = adapter_desc(&self.device).ok()?;
+        Some(String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned())
+    }
+
+    /// The maximum wave size and whether the adapter is AMD RDNA, for
+    /// offline shader translation followed by host pipeline creation.
+    pub fn translation_caps(&self) -> Option<(u32, bool)> {
+        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a feature structure of the requested type and size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of_val(&waves) as u32,
+            )
+        }
+        .ok()?;
+        let rdna = waves.WaveLaneCountMin == 32
+            && waves.WaveLaneCountMax == 64
+            && adapter_desc(&self.device).is_ok_and(|desc| desc.VendorId == 0x1002);
+        Some((waves.WaveLaneCountMax, rdna))
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -405,9 +282,7 @@ impl Host {
     }
 
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow (by root parameter, CBV before SRV
-    /// before UAV), then the title-memory page table and written-pages
-    /// bitmap if a stage reads or writes title memory.
+    /// parameter k, root views follow.
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -426,73 +301,34 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // (slot, kind): 0 CBV, 1 SRV, 2 UAV.
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s
-                    .root_cbvs
-                    .iter()
-                    .filter(|&&r| r != super::HEAP_BOUNDS)
-                    .map(|&r| (r, 0));
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
                 let srvs = s.root_srvs.iter().map(|&r| (r, 1));
                 cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        let mut views: Vec<(u32, u32, u8)> = views
-            .into_iter()
-            .map(|(slot, kind)| (u32::from(slot), super::ROOT_CBV_SPACE, kind))
-            .collect();
-        if stages.iter().any(|(s, _)| s.memory) {
-            views.push((0, super::MEMORY_SPACE, 1));
-        }
-        if stages.iter().any(|(s, _)| s.memory_writes) {
-            views.push((0, super::MEMORY_SPACE, 2));
-        }
-        if stages.iter().any(|(s, _)| s.view_addresses) {
-            views.push((1, super::MEMORY_SPACE, 1));
-        }
-        if stages.iter().any(|(s, _)| s.view_marks) {
-            views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
-            views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
-        }
-        for (register, space, kind) in views {
+        for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
-                    0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
                     1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    _ => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    2 => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_CBV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: register,
-                        RegisterSpace: space,
+                        ShaderRegister: u32::from(slot),
+                        RegisterSpace: super::ROOT_CBV_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
-        let bounds = stages
-            .iter()
-            .any(|(s, _)| s.root_cbvs.contains(&super::HEAP_BOUNDS))
-            .then(|| {
-                let index = params.len() as u32;
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: super::HEAP_BOUNDS.into(),
-                            RegisterSpace: super::ROOT_CBV_SPACE,
-                            Num32BitValues: super::HEAP_BOUND_WORDS,
-                        },
-                    },
-                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-                });
-                index
-            });
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         // SAFETY: the feature query writes the structure of the given size.
         // Older runtimes may not recognize OPTIONS19; that means no support.
@@ -551,20 +387,7 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            let root: ID3D12RootSignature =
-                self.device.CreateRootSignature(0, bytes).map_err(err)?;
-            #[cfg(test)]
-            if let Some(param) = bounds {
-                root.SetPrivateData(
-                    &HEAP_BOUNDS_PARAM,
-                    size_of::<u32>() as u32,
-                    Some((&raw const param).cast()),
-                )
-                .map_err(err)?;
-            }
-            #[cfg(not(test))]
-            let _ = bounds;
-            Ok(root)
+            self.device.CreateRootSignature(0, bytes).map_err(err)
         }
     }
 
@@ -593,7 +416,34 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+    }
+
+    /// The error with the debug layer's messages since the last call, if
+    /// the layer is on (`VICTORY_D3D12_DEBUG`).
+    fn explained(&self, e: windows::core::Error) -> String {
+        let mut text = err(e);
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return text;
+        };
+        // SAFETY: each message is read into a buffer of the size the queue
+        // asks for, aligned for the message header.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut len = 0usize;
+                let _ = queue.GetMessage(i, None, &mut len);
+                let mut buffer = vec![0u64; len.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut len).is_ok() {
+                    let m = &*message;
+                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
+                    text.push_str(" | ");
+                    text.push_str(&String::from_utf8_lossy(bytes));
+                }
+            }
+            queue.ClearStoredMessages();
+        }
+        text
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -616,15 +466,16 @@ impl Host {
         vs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
-        self.pipeline_gs(root, vs, &[], ps)
+        self.pipeline_with_gs(root, vs, None, ps)
     }
 
-    /// As [`Host::pipeline_with`], with a geometry shader (none if empty).
-    pub fn pipeline_gs(
+    /// As [`Host::pipeline_with`], with a geometry shader between the two
+    /// (the rectangle stage, `rect_list_gs`).
+    pub fn pipeline_with_gs(
         &self,
         root: &ID3D12RootSignature,
         vs: &[u8],
-        gs: &[u8],
+        gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
@@ -658,10 +509,10 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
-            GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.as_ptr().cast(),
                 BytecodeLength: gs.len(),
-            },
+            }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
@@ -812,234 +663,6 @@ impl Host {
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
-
-    /// Whether this device fuses DXIL `FMad`, which the lowering emits for
-    /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
-    /// does not, their results can differ in kind (NaN where an overflowing
-    /// product meets an infinity, 0 where the fused result is tiny). Runs
-    /// the lowered `v_fma_f32` of (1 - 2^-24, 1 + 2^-23, -1) once: 2^-24 -
-    /// 2^-47 fused, 0 not.
-    pub fn fuses_fmad(&self) -> Result<bool, String> {
-        let shader = fmad_probe().map_err(|e| e.to_string())?;
-        let (root, pso) = self.compute_pipeline(&shader)?;
-        let operands = [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000];
-        let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            if u.root == crate::native::RootType::Constants {
-                user_data[u.index as usize] = operands[u.dword as usize % 3];
-            }
-        }
-        let dev = &self.device;
-        // SAFETY: D3D12 calls with descriptions that outlive them; the
-        // resources stay alive until the fence says the GPU is done.
-        unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
-            let alloc: ID3D12CommandAllocator = dev
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .map_err(err)?;
-            let list: ID3D12GraphicsCommandList = dev
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
-                .map_err(err)?;
-            let buffer = |heap, flags| -> Result<ID3D12Resource, String> {
-                let mut r: Option<ID3D12Resource> = None;
-                dev.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES {
-                        Type: heap,
-                        ..Default::default()
-                    },
-                    D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC {
-                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                        Width: 256,
-                        Height: 1,
-                        DepthOrArraySize: 1,
-                        MipLevels: 1,
-                        SampleDesc: DXGI_SAMPLE_DESC {
-                            Count: 1,
-                            Quality: 0,
-                        },
-                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                        Flags: flags,
-                        ..Default::default()
-                    },
-                    if heap == D3D12_HEAP_TYPE_READBACK {
-                        D3D12_RESOURCE_STATE_COPY_DEST
-                    } else {
-                        D3D12_RESOURCE_STATE_COMMON
-                    },
-                    None,
-                    &mut r,
-                )
-                .map_err(err)?;
-                r.ok_or_else(|| "no buffer".to_string())
-            };
-            let out = buffer(
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            )?;
-            let readback = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE)?;
-            let views: ID3D12DescriptorHeap = dev
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: 1,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    ..Default::default()
-                })
-                .map_err(err)?;
-            dev.CreateUnorderedAccessView(
-                &out,
-                None,
-                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: DXGI_FORMAT_R32_TYPELESS,
-                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_UAV {
-                            NumElements: 64,
-                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                            ..Default::default()
-                        },
-                    },
-                }),
-                views.GetCPUDescriptorHandleForHeapStart(),
-            );
-            // The translated root signature directly indexes both heaps.
-            let samplers: ID3D12DescriptorHeap = dev
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    NumDescriptors: 1,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    ..Default::default()
-                })
-                .map_err(err)?;
-            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
-            list.SetComputeRootSignature(&root);
-            list.SetComputeRoot32BitConstants(
-                0,
-                user_data.len() as u32,
-                user_data.as_ptr().cast(),
-                0,
-            );
-            list.Dispatch(1, 1, 1);
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::transmute_copy(&out),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    }),
-                },
-            }]);
-            list.CopyBufferRegion(&readback, 0, &out, 0, 4);
-            list.Close().map_err(err)?;
-            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
-            let mut p = std::ptr::null_mut();
-            readback.Map(0, None, Some(&mut p)).map_err(err)?;
-            let bits = p.cast::<u32>().read();
-            readback.Unmap(0, None);
-            Ok(bits != 0)
-        }
-    }
-}
-
-/// `v_fma_f32 v0, s0, s1, s2` (through VGPRs) stored to dword 0 of the raw
-/// UAV a table at s4 names, lowered as a title's program is.
-fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
-    use crate::native::{
-        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
-    };
-    let words: [u32; 11] = [
-        0xBE85_0380, // s_mov_b32 s5, 0
-        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
-        0xFA00_0000,
-        0x7E02_0200, // v_mov_b32 v1, s0
-        0x7E04_0201, // v_mov_b32 v2, s1
-        0x7E06_0202, // v_mov_b32 v3, s2
-        0xD54B_0000, // v_fma_f32 v0, v1, v2, v3
-        0x040E_0501,
-        0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
-        0x8002_0000,
-        0xBF81_0000, // s_endpgm
-    ];
-    let param = |root, user_data, sgprs, slot| RootParam {
-        root,
-        table_offset_dwords: 0,
-        sgprs,
-        base_register: 0,
-        user_data,
-        slot,
-    };
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
-        layout: vec![
-            param(RootType::Constants, 0, 4, 0),
-            param(RootType::Table, 4, 1, 1),
-        ],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 4,
-            slot: 1,
-        }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
-            threads: [1, 1, 1],
-        }),
-        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
-    let st = crate::structure::structure(&p)?;
-    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = crate::io::raise(&p, &native)?;
-    let lowered = super::lower::lower(&super::lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: false,
-    })?;
-    Ok(HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        memory: lowered.memory,
-        memory_writes: lowered.memory_writes,
-        view_addresses: lowered.view_addresses,
-        heap: lowered.heap,
-        heap_writes: lowered.heap_writes,
-        view_marks: lowered.view_marks,
-    })
 }
 
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
@@ -1132,12 +755,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
-        memory: false,
-        memory_writes: false,
-        view_addresses: false,
-        heap: false,
-        heap_writes: false,
-        view_marks: false,
+        root_indexed_views: Vec::new(),
     }
 }
 
@@ -1156,9 +774,6 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
-    /// A root raw UAV of this many dwords, zeroed, read back after the
-    /// heap's UAVs ([`Host::dispatch`] only).
-    Uav(u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -1268,19 +883,10 @@ impl Host {
                 .map_err(err)?;
             let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
             dev.CreateRenderTargetView(&target, None, rtv);
-            let bounds_param = bounds_parameter(root);
-            let view_limit = d.textures.len() as u32;
-            let sampler_limit = d.samplers.len() as u32;
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: (view_limit
-                        + if bounds_param.is_some() {
-                            super::NULL_VIEWS
-                        } else {
-                            0
-                        })
-                    .max(1),
+                    NumDescriptors: d.textures.len().max(1) as u32,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -1288,13 +894,7 @@ impl Host {
             let sampler_heap: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    NumDescriptors: (sampler_limit
-                        + if bounds_param.is_some() {
-                            super::NULL_SAMPLERS
-                        } else {
-                            0
-                        })
-                    .max(1),
+                    NumDescriptors: d.samplers.len().max(1) as u32,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -1393,17 +993,6 @@ impl Host {
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
             list.SetGraphicsRootSignature(root);
-            if let Some(param) = bounds_param {
-                make_heap_nulls(dev, &views, view_limit, false);
-                make_heap_nulls(dev, &sampler_heap, sampler_limit, true);
-                let bounds = [view_limit, sampler_limit, view_limit];
-                list.SetGraphicsRoot32BitConstants(
-                    param,
-                    super::HEAP_BOUND_WORDS,
-                    bounds.as_ptr().cast(),
-                    0,
-                );
-            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
@@ -1422,7 +1011,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                    Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1549,39 +1138,26 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F texture SRV with mips (width, height, levels, texels of
-    /// each level in turn).
-    Mipped(u32, u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
-    Cube(u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV with mips (face size, levels, texels of each
-    /// face's levels in turn).
-    MippedCube(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F square texture SRV (size, levels) whose texels in level
-    /// `n` are all `n`.
-    Levels(u32, u32),
+    /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
+    Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
-    /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
-    Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
+    TypedUav {
+        data: &'a [u32],
+        format: DXGI_FORMAT,
+        elem_bytes: u32,
+    },
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
-    /// Title memory: a buffer holding these dwords viewed raw, as an SRV at
-    /// its index and a UAV at the next (whose entry is [`View::Pair`]),
-    /// read back like the UAVs.
-    Memory(&'a [u32]),
-    /// Null raw SRV and UAV at this index and the next ([`View::Pair`]).
-    NullPair,
-    /// The second slot of a [`View::Memory`] or [`View::NullPair`].
-    Pair,
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1617,6 +1193,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_repeated(root, pso, d, 1).map(|(output, _)| output)
+    }
+
+    pub(super) fn dispatch_repeated(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        passes: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        assert!(passes > 0);
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1676,7 +1263,7 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT, 2 for R32G32_UINT.
+            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
             let footprint_as =
                 |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1685,10 +1272,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: match words {
-                                    1 => DXGI_FORMAT_R32_UINT,
-                                    2 => DXGI_FORMAT_R32G32_UINT,
-                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                Format: if words == 1 {
+                                    DXGI_FORMAT_R32_UINT
+                                } else {
+                                    DXGI_FORMAT_R32G32B32A32_FLOAT
                                 },
                                 Width: w,
                                 Height: h,
@@ -1729,23 +1316,8 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let bounds_param = bounds_parameter(root);
-            let view_limit = d.views.len() as u32;
-            let sampler_limit = d.samplers.len() as u32;
-            let view_slots = view_limit
-                + if bounds_param.is_some() {
-                    super::NULL_VIEWS
-                } else {
-                    0
-                };
-            let sampler_slots = sampler_limit
-                + if bounds_param.is_some() {
-                    super::NULL_SAMPLERS
-                } else {
-                    0
-                };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slots as usize)?;
-            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_slots as usize)?;
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
+            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                 as usize;
@@ -1758,29 +1330,23 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..)
-                    | View::Cube(..)
-                    | View::Mipped(..)
-                    | View::MippedCube(..) => {
-                        let (w0, h0, mut texels, faces, levels) = match *v {
+                    View::Texture(..) | View::Cube(..) => {
+                        let (w, h, mut texels, faces, mips) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Mipped(w, h, l, t) => (w, h, t, 1, l),
-                            View::Cube(n, t) => (n, n, t, 6, 1),
-                            View::MippedCube(n, l, t) => (n, n, t, 6, l),
+                            View::Cube(n, mips, t) => (n, n, t, 6, mips),
                             _ => unreachable!(),
                         };
-                        let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
+                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
-                        desc.MipLevels = levels as u16;
+                        desc.MipLevels = mips;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        // Subresources face by face, each level in turn.
-                        for face in 0..(faces * levels) as usize {
-                            let level = face as u32 % levels;
-                            let (w, h) = ((w0 >> level).max(1), (h0 >> level).max(1));
+                        for sub in 0..u32::from(mips) * faces {
+                            let mip = sub % u32::from(mips);
+                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
                             let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
@@ -1789,18 +1355,19 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            let (level, rest) = texels.split_at((w * h) as usize);
+                            texels = rest;
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &level[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
                                     row.len() * 16,
                                 );
                             }
-                            texels = &texels[(w * h) as usize..];
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            at_face.Anonymous.SubresourceIndex = sub;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1822,7 +1389,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: levels,
+                                    MipLevels: u32::from(mips),
                                     ..Default::default()
                                 },
                             },
@@ -1832,53 +1399,6 @@ impl Host {
                             (faces == 6).then_some(&cube as *const _),
                             at,
                         );
-                        keep.push(tex);
-                    }
-                    View::Levels(w, levels) => {
-                        let mut desc = texture(w, w, D3D12_RESOURCE_FLAG_NONE);
-                        desc.MipLevels = levels as u16;
-                        let tex = make(
-                            D3D12_HEAP_TYPE_DEFAULT,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        for level in 0..levels {
-                            let n = (w >> level).max(1);
-                            let pitch = (n as usize * 16).next_multiple_of(256);
-                            let upload = make(
-                                D3D12_HEAP_TYPE_UPLOAD,
-                                &buffer((pitch * n as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
-                                D3D12_RESOURCE_STATE_GENERIC_READ,
-                            )?;
-                            let mut p = std::ptr::null_mut();
-                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let row = vec![[level as f32; 4]; n as usize];
-                            for y in 0..n as usize {
-                                std::ptr::copy_nonoverlapping(
-                                    row.as_ptr().cast::<u8>(),
-                                    p.cast::<u8>().add(y * pitch),
-                                    row.len() * 16,
-                                );
-                            }
-                            upload.Unmap(0, None);
-                            let mut at_level = subresource(&tex);
-                            at_level.Anonymous.SubresourceIndex = level;
-                            list.CopyTextureRegion(
-                                &at_level,
-                                0,
-                                0,
-                                0,
-                                &footprint(&upload, n, n),
-                                None,
-                            );
-                            keep.push(upload);
-                        }
-                        list.ResourceBarrier(&[transition(
-                            &tex,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                        )]);
-                        dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {
@@ -1920,6 +1440,46 @@ impl Host {
                         )?;
                         uavs.push((b, None, n, rb));
                     }
+                    View::TypedUav {
+                        data,
+                        format,
+                        elem_bytes,
+                    } => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let elements = (bytes / u64::from(elem_bytes)) as u32;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: elements,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
+                    }
                     View::TextureUav(w, h) => {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
@@ -1935,24 +1495,25 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
-                        let (format, words) = match *v {
-                            View::UintTextureUav(..) => (DXGI_FORMAT_R32_UINT, 1),
-                            _ => (DXGI_FORMAT_R32G32_UINT, 2),
-                        };
+                    View::UintTextureUav(w, h) => {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
+                            &texture_as(
+                                w,
+                                h,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                DXGI_FORMAT_R32_UINT,
+                            ),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        let pitch = (w * 4 * words).next_multiple_of(256);
+                        let pitch = (w * 4).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), words, rb));
+                        uavs.push((t, Some((w, h)), 1, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;
@@ -2009,67 +1570,6 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
-                    View::Memory(_) | View::NullPair => {
-                        let n = match *v {
-                            View::Memory(data) => data.len() as u32,
-                            _ => 0,
-                        };
-                        let b = if let View::Memory(data) = *v {
-                            let bytes = u64::from(n) * 4;
-                            let b = make(
-                                D3D12_HEAP_TYPE_DEFAULT,
-                                &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                            )?;
-                            let up = upload(data)?;
-                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
-                            list.ResourceBarrier(&[transition(
-                                &b,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                            )]);
-                            keep.push(up);
-                            Some(b)
-                        } else {
-                            None
-                        };
-                        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32_TYPELESS,
-                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                Buffer: D3D12_BUFFER_SRV {
-                                    NumElements: n,
-                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32_TYPELESS,
-                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                                Buffer: D3D12_BUFFER_UAV {
-                                    NumElements: n,
-                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        let mut next = at;
-                        next.ptr += view_size;
-                        dev.CreateShaderResourceView(b.as_ref(), Some(&srv), at);
-                        dev.CreateUnorderedAccessView(b.as_ref(), None, Some(&uav), next);
-                        if let Some(b) = b {
-                            let rb = make(
-                                D3D12_HEAP_TYPE_READBACK,
-                                &buffer(u64::from(n) * 4, D3D12_RESOURCE_FLAG_NONE),
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                            )?;
-                            uavs.push((b, None, n, rb));
-                        }
-                    }
-                    View::Pair => {}
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
@@ -2079,17 +1579,6 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
-            if let Some(param) = bounds_param {
-                make_heap_nulls(dev, &views, view_limit, false);
-                make_heap_nulls(dev, &samplers, sampler_limit, true);
-                let bounds = [view_limit, sampler_limit, view_limit];
-                list.SetComputeRoot32BitConstants(
-                    param,
-                    super::HEAP_BOUND_WORDS,
-                    bounds.as_ptr().cast(),
-                    0,
-                );
-            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
@@ -2118,25 +1607,47 @@ impl Host {
                         }
                         keep.push(b);
                     }
-                    &Root::Uav(n) => {
-                        let bytes = u64::from(n) * 4;
-                        let b = make(
-                            D3D12_HEAP_TYPE_DEFAULT,
-                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
-                        )?;
-                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
-                        let rb = make(
-                            D3D12_HEAP_TYPE_READBACK,
-                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        uavs.push((b, None, n, rb));
-                    }
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            let timing = if passes > 1 {
+                let mut query: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut query,
+                ).map_err(err)?;
+                let back = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let query = query.ok_or("no timestamp query heap")?;
+                list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                Some((query, back))
+            } else {
+                None
+            };
+            let uav_order = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER::default()),
+                },
+                ..Default::default()
+            };
+            for pass in 0..passes {
+                if pass != 0 {
+                    list.ResourceBarrier(std::slice::from_ref(&uav_order));
+                }
+                list.Dispatch(x, y, z);
+            }
+            if let Some((query, back)) = &timing {
+                list.EndQuery(query, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(query, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -2190,7 +1701,20 @@ impl Host {
                 out.push(words);
             }
             drop(keep);
-            Ok(out)
+            let ns = if let Some((_, back)) = timing {
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).map_err(err)?;
+                let [start, end] = *p.cast::<[u64; 2]>();
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+                if end <= start {
+                    return Err("timestamp batch did not advance".into());
+                }
+                (end - start) as f64 * 1e9 / queue.GetTimestampFrequency().map_err(err)? as f64
+                    / f64::from(passes)
+            } else {
+                0.0
+            };
+            Ok((out, ns))
         }
     }
 }

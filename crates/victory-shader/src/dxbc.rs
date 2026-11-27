@@ -17,8 +17,7 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
-    /// Native code from another compiler, in place of `DXIL`
-    /// ([`crate::native::fspx_program`]).
+    /// Native code another compiler made, in place of `DXIL` (VIctory upstream 0b35b7f).
     pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
@@ -62,6 +61,8 @@ pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
+    /// Input before trimming to the DXBC size, as used by shader log hashes.
+    pub(crate) input: &'a [u8],
 }
 
 const HEADER_SIZE: usize = 0x20;
@@ -78,6 +79,7 @@ impl<'a> Container<'a> {
         if total > data.len() || total < HEADER_SIZE {
             return Err(ShaderError::Malformed("container size disagrees with data"));
         }
+        let input = data;
         let data = &data[..total];
         let count = u32_at(data, 0x1C)? as usize;
         if count > MAX_PARTS {
@@ -106,6 +108,7 @@ impl<'a> Container<'a> {
             digest,
             version,
             parts,
+            input,
         })
     }
 
