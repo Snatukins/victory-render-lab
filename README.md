@@ -17,26 +17,14 @@
 
 **The opening world reached the screen on the RTX 4060.** In the latest captured local run, Lucia, her hair, nearby characters, interior surfaces, and the sunlit yard were visible in the presented image. An earlier local capture showed geometry in the intermediate buffers and a black presented frame. Reaching the visible scene is the project's clearest rendering milestone so far.
 
-```mermaid
-xychart-beta
-    title "Build & Performance Audit (%)"
-    x-axis ["Opening Milestones", "World Speed", "Story Coverage*", "Shader Coverage*"]
-    y-axis "Percent" 0 --> 100
-    bar [80, 3.7, 0, 0]
-```
-
-*Story and shader coverage are unmeasured. Their zero bars are placeholders.*
-
 | Check | Progress | Evidence |
-| --- | --- | --- |
-| Opening milestones | 🟢🟢🟢🟢⚪ **4/5 · 80%** | Boot, title card, visible character, and lit environment observed. Repeatable completion at the performance target is open. |
-| World speed | 🟠⚪⚪⚪⚪ **3.7% of target** | The last 17 logged samples had a median of **1.1 FPS** against a **30 FPS** development target. Range **0.2–3.0 FPS**. |
-| Full story and feature coverage | ⚪ **Unmeasured** | No local mission-by-mission or feature-by-feature audit has been completed. |
-| Current shader coverage | ⚪ **Unmeasured** | The integrated revision still needs a fresh shader census. |
+| :--- | :--- | :--- |
+| **Opening milestones** | ![80%](https://img.shields.io/badge/Opening-80%25-brightgreen) | Boot, title card, visible character, and lit environment observed. Repeatable completion at the performance target is open. |
+| **World speed** | ![3.7%](https://img.shields.io/badge/FPS%20target-3.7%25-orange) | The last 17 logged samples had a median of **1.1 FPS** against a **30 FPS** development target. Range **0.2–3.0 FPS**. |
+| **Full story and feature coverage** | ![Unmeasured](https://img.shields.io/badge/coverage-unmeasured-lightgrey) | No local mission-by-mission or feature-by-feature audit has been completed. |
+| **Current shader coverage** | ![Unmeasured](https://img.shields.io/badge/coverage-unmeasured-lightgrey) | The integrated revision still needs a fresh shader census. |
 
-Each green dot in the opening row is one completed checklist item. The orange dot marks a measured performance shortfall. These metrics describe the local experiment. The FPS figure is a median of log samples. The opening checklist covers five milestones and gives no estimate of total game completion.
-
-**Local run configuration.** RTX 4060, Series S profile, DLSS Quality, a 1920×1080 window cap, a 40 ms texture staging budget, and the launcher's shader-skip profile. The visual result is for that configuration. The capture confirms a visible scene, and the log still shows major frame-time spikes and dropped indirect commands.
+**Local run configuration.** RTX 4060, Series S profile, DLSS Quality, a 1920×1080 window cap, a 40 ms texture staging budget, and the launcher's shader-skip profile. The capture confirms a visible scene, and the log still shows major frame-time spikes and dropped indirect commands.
 
 ## What this repo adds
 
