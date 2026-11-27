@@ -133,6 +133,12 @@ enum Command {
         /// Processes at once (default: two thirds of the logical cores).
         #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
+        /// Pipelines per process (default: 40). Keep batches within the Windows command-line limit.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+        batch_size: Option<u16>,
+        /// Use normal Windows priority for the workers (default: idle).
+        #[arg(long)]
+        normal_priority: bool,
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
@@ -244,7 +250,9 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs, list, if_needed } => translate::precompile(paths, jobs, list, if_needed),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, batch_size, normal_priority, limit, again, used, these } => {
+            warm::run(jobs, batch_size, normal_priority, limit, again, used, these)
+        }
         Command::Run {
             exe,
             unimplemented,
