@@ -84,6 +84,83 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+const STARTUP_LOW_BYTES: usize = 192 * MIB;
+static STARTUP_LOW: Mutex<Option<StartupPlaceholder>> = Mutex::new(None);
+
+struct StartupPlaceholder {
+    base: usize,
+    len: usize,
+}
+
+impl StartupPlaceholder {
+    fn take(&mut self, size: usize) -> Option<*mut c_void> {
+        if size == 0 || size > self.len || !size.is_multiple_of(PAGE) {
+            return None;
+        }
+        let base = self.base as *mut c_void;
+        // SAFETY: we own the placeholder. Splitting leaves two reservations,
+        // so no other allocator can take the title's part during the handoff.
+        if size < self.len
+            && unsafe { VirtualFree(base, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0
+        {
+            return None;
+        }
+        self.base += size;
+        self.len -= size;
+        Some(base)
+    }
+}
+
+impl Drop for StartupPlaceholder {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            // SAFETY: only the unclaimed remainder belongs to us.
+            unsafe { VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE) };
+        }
+    }
+}
+
+/// Keeps an uncommitted low-address window available across title startup.
+pub struct StartupLowMemory(());
+
+pub fn reserve_startup_low_memory() -> Option<StartupLowMemory> {
+    let mut slot = STARTUP_LOW.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return None;
+    }
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        HighestEndingAddress: u32::MAX as usize as *mut c_void,
+        ..Default::default()
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: a reservation only, with a live address-requirements parameter.
+    let base = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null_mut(),
+            STARTUP_LOW_BYTES,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            &mut parameter,
+            1,
+        )
+    };
+    if base.is_null() {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not reserve early 32-bit placeholder");
+        return None;
+    }
+    *slot = Some(StartupPlaceholder { base: base as usize, len: STARTUP_LOW_BYTES });
+    Some(StartupLowMemory(()))
+}
+
+impl Drop for StartupLowMemory {
+    fn drop(&mut self) {
+        STARTUP_LOW.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -111,7 +188,8 @@ pub extern "system" fn XMemVirtualAlloc(
     // shortcut: committing part of such a reservation later would fail
     // (the title's 23 calls never do); replace that part of the
     // placeholder then.
-    let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
+    let placeholder = kind & MEM_COMMIT == 0
+        && (kind & PAGES_64K == PAGES_64K || kind & MEM_RESERVE_PLACEHOLDER != 0);
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
             // Part of a placeholder the title split: it stays one.
@@ -137,9 +215,17 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
-    // SAFETY: the title's own arguments, cleaned of console bits; the
-    // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let early = (constrained && placeholder && flags & ADDRESS_32BIT != 0 && size >= 128 * MIB)
+        .then(|| {
+            let mut slot = STARTUP_LOW.lock().unwrap_or_else(|e| e.into_inner());
+            let base = slot.as_mut()?.take(size)?;
+            slot.take();
+            tracing::info!(?base, size, "using early 32-bit placeholder");
+            Some(base)
+        })
+        .flatten();
+    let at = early.unwrap_or_else(|| unsafe {
+        // SAFETY: the title's arguments and a live address requirements parameter.
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -153,7 +239,7 @@ pub extern "system" fn XMemVirtualAlloc(
             },
             constrained.into(),
         )
-    };
+    });
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {

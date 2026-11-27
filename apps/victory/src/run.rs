@@ -144,6 +144,9 @@ pub fn run(
     if execute {
         check_cpu_features()?;
     }
+    let _startup_low = (execute && matches!(console, Console::SeriesS))
+        .then(victory_hle::modules::xmem::reserve_startup_low_memory)
+        .flatten();
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;

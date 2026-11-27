@@ -13,7 +13,9 @@
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by GPU vendor; on NVIDIA, worker counts sized to the CPU and,
 #               for a card of 10 to 19 GB, title buffers in the card's memory),
-#               7900xtx, 4070, 4070tisuper, 4090, 3060 or laptop
+#               7900xtx, 4070, 4070tisuper, 4090, 4060, 3060 or laptop
+#               (4060: six-core NVIDIA desktop with an 8 GB card and 16 GB of RAM;
+#               defaults to Series S with DLSS Quality when its DLL is configured)
 #               (3060: a six-core NVIDIA desktop with 16 GB of RAM and a 12 GB card, docs/rtx3060-16gb.md;
 #               laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
@@ -35,7 +37,7 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '4060', '3060', 'laptop')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -185,7 +187,7 @@ if ($Machine -eq '4070tisuper') {
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'; $settings.VICTORY_WINDOWS_BAR_MB = '4096'
     }
 }
-if ($Machine -eq 'laptop') {
+if ($Machine -in 'laptop', '4060') {
     # i7-13700H, RTX 3050 6 GB Laptop GPU, 16 GB (docs/laptop-16gb.md); asked for explicitly,
     # the measurements cover that one machine. On top of the NVIDIA settings above, which the
     # measured runs had: what makes the world load fit in 16 GB. These stay under -Safe too,
@@ -209,6 +211,19 @@ if ($Machine -eq 'laptop') {
     $settings.VICTORY_OUTPUT = '1920x1080'; $settings.VICTORY_UPSCALER = '6'; $settings.VICTORY_RENDER_SCALE = '0.5'
     # No RAM throttle and no change to the title's watchdog here: the world load fits with the
     # settings above (docs/laptop-16gb.md); for longer sessions see #96 and #126 there.
+}
+if ($Machine -eq '4060') {
+    # Use the small-memory paths with worker counts sized for the Ryzen 5 5600.
+    $settings.VICTORY_THIN_THREADS = '6'; $settings.VICTORY_UNDER_THREADS = '4'
+    $settings.VICTORY_LAND_THREADS = '3'; $settings.VICTORY_PIPELINE_WORKERS = '3'
+    if (-not $Safe) {
+        $settings.VICTORY_PORT_CONSTANTS = '1'
+    }
+    if (-not $PSBoundParameters.ContainsKey('Console')) { $Console = 'series-s' }
+    if ($Console -eq 'series-s' -and -not ($Dlss -or $Fsr) -and $env:VICTORY_DLSS_DIR) {
+        $dlssDll = Join-Path $env:VICTORY_DLSS_DIR 'nvngx_dlss.dll'
+        if (Test-Path -LiteralPath $dlssDll -PathType Leaf) { $Dlss = 'quality' }
+    }
 }
 # -Safe leaves out every way still on trial, and the newest faster ones.
 if ($Safe) {
