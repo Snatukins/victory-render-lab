@@ -5,7 +5,7 @@
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
-# -WarmPipelines compile previously used pipelines before launching and record new ones
+# -WarmPipelines compile previously used pipelines before launching and record new ones (on for 4060)
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -FrameGen     AMD frame generation
 # -Fsr / -Dlss  PC upscaling in Series S (quality, balanced or performance)
@@ -227,6 +227,7 @@ if ($Machine -eq '4060') {
         $settings.VICTORY_PORT_CONSTANTS = '1'
     }
     if (-not $PSBoundParameters.ContainsKey('Console')) { $Console = 'series-s' }
+    if (-not $PSBoundParameters.ContainsKey('WarmPipelines')) { $WarmPipelines = $true }
     if ($Console -eq 'series-s' -and -not ($Dlss -or $Fsr) -and $env:VICTORY_DLSS_DIR) {
         $dlssDll = Join-Path $env:VICTORY_DLSS_DIR 'nvngx_dlss.dll'
         if (Test-Path -LiteralPath $dlssDll -PathType Leaf) { $Dlss = 'quality' }
@@ -326,7 +327,7 @@ try {
     }
     if ($WarmPipelines) {
         & $victory warm --used --jobs 3
-        if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up exited with code $LASTEXITCODE" }
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Pipeline warm-up exited with code $LASTEXITCODE. Starting the game with the current cache." }
     }
     & $victory run $Exe --console $Console --execute
     $runtimeExitCode = $LASTEXITCODE

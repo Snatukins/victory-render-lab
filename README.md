@@ -135,7 +135,8 @@ Pass an archive path to `shaders` to scan just that archive. At launch, `--if-ne
 Pass `-WarmPipelines` to the PowerShell launcher to compile previously used
 pipelines before starting the game and record newly encountered pipelines.
 The first run with this option records the pipeline descriptions for the
-next launch. The descriptions stay in the local cache.
+next launch. The descriptions stay in the local cache. The RTX 4060 profile
+enables this by default. Pass `-WarmPipelines:$false` to skip it for one run.
 
 When comparing warm-up times, `warm --used --batch-size 80` tests longer batches and
 `warm --used --normal-priority` tests normal worker priority. The defaults are
