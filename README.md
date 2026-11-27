@@ -132,6 +132,10 @@ Run these steps separately from the repository root to warm the shader cache and
 ```
 
 Pass an archive path to `shaders` to scan just that archive. `-SkipShaders` skips pretranslation at launch.
+Pass `-WarmPipelines` to the PowerShell launcher to compile previously used
+pipelines before starting the game and record newly encountered pipelines.
+The first run with this option records the pipeline descriptions for the
+next launch. The descriptions stay in the local cache.
 
 </details>
 

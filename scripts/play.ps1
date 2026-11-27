@@ -5,6 +5,7 @@
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
+# -WarmPipelines compile previously used pipelines before launching and record new ones
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -FrameGen     AMD frame generation
 # -Fsr / -Dlss  PC upscaling in Series S (quality, balanced or performance)
@@ -30,6 +31,7 @@ param(
     [switch]$Windowed,
     [switch]$NoPanel,
     [switch]$SkipShaders,
+    [switch]$WarmPipelines,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$FrameGen,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr,
@@ -241,6 +243,7 @@ if (-not $Windowed) { $settings.VICTORY_FULLSCREEN = '1' }
 # corner, so clips and screenshots show what the build runs at and on what PC.
 if (-not $NoPanel) { $settings.VICTORY_PANEL = '1' }
 if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1' }
+if ($WarmPipelines) { $settings.VICTORY_PIPELINE_BOOK = '1' }
 if ($Fsr -or $Dlss) { $settings.Remove('VICTORY_UPSCALER') }
 if ($Fsr) { $settings.VICTORY_FSR = $Fsr.ToLowerInvariant() }
 if ($Dlss) { $settings.VICTORY_DLSS = $Dlss.ToLowerInvariant() }
@@ -315,6 +318,10 @@ try {
                 if ($LASTEXITCODE -ne 0) { Write-Host "victory shaders ended with exit code $LASTEXITCODE; starting anyway." }
             }
         }
+    }
+    if ($WarmPipelines) {
+        & $victory warm --used --jobs 3
+        if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up exited with code $LASTEXITCODE" }
     }
     & $victory run $Exe --console $Console --execute
 } finally { Pop-Location }
