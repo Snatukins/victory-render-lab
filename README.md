@@ -17,6 +17,16 @@
 
 **The opening world reached the screen on the RTX 4060.** In the latest captured local run, Lucia, her hair, nearby characters, interior surfaces, and the sunlit yard were visible in the presented image. An earlier local capture showed geometry in the intermediate buffers and a black presented frame. Reaching the visible scene is the project's clearest rendering milestone so far.
 
+```mermaid
+xychart-beta
+    title "Build & Performance Audit (%)"
+    x-axis ["Opening Milestones", "World Speed", "Story Coverage*", "Shader Coverage*"]
+    y-axis "Percent" 0 --> 100
+    bar [80, 3.7, 0, 0]
+```
+
+*Story and shader coverage are unmeasured. Their zero bars are placeholders.*
+
 | Check | Progress | Evidence |
 | --- | --- | --- |
 | Opening milestones | 🟢🟢🟢🟢⚪ **4/5 · 80%** | Boot, title card, visible character, and lit environment observed. Repeatable completion at the performance target is open. |
