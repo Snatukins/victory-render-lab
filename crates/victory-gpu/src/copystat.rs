@@ -94,8 +94,15 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    DirtyPages,
+    CoalescedRuns,
+    BytesCompared,
+    FallbackComparisons,
+    FenceWaitUs,
+    RetirementUs,
+    QueueDepthTwo,
 }
-const COUNTERS: usize = 57;
+const COUNTERS: usize = C::QueueDepthTwo as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -290,6 +297,19 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    tracing::info!(
+        "dirty tracking per frame: {:.0} pages, {:.0} coalesced runs, {:.1} MB compared, {:.0} fallback comparisons",
+        c[C::DirtyPages as usize],
+        c[C::CoalescedRuns as usize],
+        mb(c[C::BytesCompared as usize]),
+        c[C::FallbackComparisons as usize],
+    );
+    tracing::info!(
+        "submission timing per frame: fence wait {:.1} ms, retirement {:.1} ms, {:.1} submissions reached depth 2",
+        ms(c[C::FenceWaitUs as usize]),
+        ms(c[C::RetirementUs as usize]),
+        c[C::QueueDepthTwo as usize],
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

@@ -14,6 +14,24 @@ use crate::object::{
 };
 use crate::resource::PAGEABLE_IIDS;
 
+/// Shared heap bounds use three DWORDs, independent of shader stage.
+pub(crate) fn heap_bounds_parameter() -> windows::Win32::Graphics::Direct3D12::D3D12_ROOT_PARAMETER1
+{
+    use victory_shader::emit::{HEAP_BOUND_WORDS, HEAP_BOUNDS, ROOT_CBV_SPACE};
+    use windows::Win32::Graphics::Direct3D12::*;
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: HEAP_BOUNDS.into(),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Num32BitValues: HEAP_BOUND_WORDS,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
 const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
     guid(
         0xc54a6b66,

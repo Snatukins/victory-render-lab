@@ -642,7 +642,7 @@ impl Prebuild {
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
         let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            host::HostPipeline::build(&self.shaders, self.graphics.as_deref(), |_| {})
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
@@ -667,6 +667,11 @@ impl Prebuild {
 pub fn pipeline_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
+#[cfg(windows)]
+pub(crate) fn note_commit_headroom(available: usize) {
+    make::note_commit_headroom(available);
 }
 
 /// Whether a pre-build has put the title pipeline `key` in the library

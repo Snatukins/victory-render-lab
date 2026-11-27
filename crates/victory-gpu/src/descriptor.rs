@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// A shader-visible heap in the title's memory, tracked: the title also
@@ -81,6 +81,12 @@ impl Heap {
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+        self.shared_host().map(std::sync::Arc::as_ref)
+    }
+
+    /// The host heap itself, for recordings that own its temporary slots.
+    #[cfg(windows)]
+    pub(crate) fn shared_host(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
@@ -98,7 +104,7 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
             .as_ref()
     }
@@ -109,6 +115,30 @@ impl Heap {
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
+    }
+
+    /// An exact snapshot of a view table's records. Ignore empty and stale
+    /// descriptors so both produce the same null slot in a temporary table.
+    #[cfg(windows)]
+    pub(crate) fn view_table_keys(&self, first: u64, count: u32) -> Option<Box<[ViewKey]>> {
+        let start = self.index(first)?;
+        if self.desc.kind != VIEWS_KIND
+            || first != self.start + u64::from(start) * 32
+            || count > self.desc.count - start
+        {
+            return None;
+        }
+        let mut keys = Vec::with_capacity(count as usize);
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        for index in 0..count {
+            let handle = first + u64::from(index) * 32;
+            // SAFETY: the range was checked against this heap's bounds.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let live = tag == VIEW_TAG
+                && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation);
+            keys.push(ViewKey(if live { u64::from(generation) << 32 | u64::from(i) } else { 0 }));
+        }
+        Some(keys.into_boxed_slice())
     }
 }
 
@@ -189,19 +219,6 @@ pub(crate) fn sync_heaps() {
     }
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
-#[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
-    }
-}
-
 /// Runs `f` on the host heap behind the title heap at `heap` while that
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]
@@ -222,6 +239,8 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        crate::memory::forget_heap(at);
     }
 }
 
@@ -377,6 +396,22 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// The identity of a live descriptor, including its resource generation.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ViewKey(u64);
+
+#[cfg(windows)]
+impl ViewKey {
+    pub(crate) fn is_live(self) -> bool {
+        self.0 != 0
+    }
+
+    pub(crate) fn view(self) -> Option<View> {
+        self.is_live().then(|| view_at(self.0 as u32, (self.0 >> 32) as u32)).flatten()
+    }
+}
+
 impl View {
     /// The resource objects the view names.
     fn resources(&self) -> [usize; 2] {
@@ -470,10 +505,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -714,6 +748,26 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(windows, test))]
+pub(crate) fn test_capped_view_heap() -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let desc = Extended(
+        HeapDesc { kind: VIEWS_KIND, count: 8, flags: SHADER_VISIBLE, nodes: 0 },
+        Placement { address: 0, size: 0 },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut out),
+        crate::object::S_OK,
+    );
+    let portable = 2 + 2 + victory_shader::emit::NULL_VIEWS;
+    let host = host::HostHeap::new_with_limits(false, desc.0.count, None, portable, [2, 2], 0)
+        .expect("tiny host heap");
+    assert!(heap(out).host.set(Some(std::sync::Arc::new(host))).is_ok());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +807,17 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[test]
+    fn null_constant_descriptor_replaces_the_previous_view() {
+        let mut bytes = [0u64; 4];
+        let slot = bytes.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        create_cbv(null, &[0x1000, 1, 256, 0], slot);
+        assert_eq!(view(slot), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, null.cast(), slot);
+        assert_eq!(view(slot), Some(View::Constant(0, 0)));
     }
 
     #[test]

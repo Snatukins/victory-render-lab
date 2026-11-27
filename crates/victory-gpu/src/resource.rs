@@ -316,11 +316,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -751,10 +751,12 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
-    /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// Textures also live on the host GPU (decision 0007). Textures without
+    /// writable views can wait until their first host use.
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    #[cfg(windows)]
+    initial_state: u32,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -832,6 +834,9 @@ static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 static TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(windows)]
 static TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+pub(crate) static DEFERRED_TEXTURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Title textures that found their memory's host texture made already.
 #[cfg(windows)]
 static SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -965,7 +970,7 @@ pub(crate) mod life {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host_texture()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -980,7 +985,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host_texture().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -989,7 +994,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host_texture().cloned()
 }
 
 /// The host description of a title texture: the same, without the
@@ -1156,7 +1161,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 #[cfg(windows)]
 fn current(this: This) -> bool {
     let r = resource(this);
-    let (Some(h), Some(k)) = (&r.host, memory_key(r.data() as u64, &r.desc)) else {
+    let (Some(h), Some(k)) = (r.host.get().and_then(Option::as_ref), memory_key(r.data() as u64, &r.desc)) else {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1286,6 +1291,19 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
 }
 
 impl Resource {
+    #[cfg(windows)]
+    fn host_texture(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host
+            .get_or_init(|| {
+                let host = shared_texture(
+                    self.data() as u64, &self.desc, self.initial_state, std::ptr::null(),
+                );
+                DEFERRED_TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                host
+            })
+            .as_ref()
+    }
+
     fn data(&self) -> *mut u8 {
         match self.backing {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
@@ -1321,25 +1339,30 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
-    #[allow(unused_mut)] // the host texture is set on Windows only
-    let mut resource = Box::new(Resource {
+    let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
         heap,
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: None,
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        initial_state: state,
     });
     #[cfg(windows)]
     {
-        resource.host = shared_texture(resource.data() as u64, &desc, state, clear);
+        if desc.dimension == BUFFER || desc.flags & USES != 0 || !clear.is_null() {
+            let _ = resource.host.set(shared_texture(resource.data() as u64, &desc, state, clear));
+        } else {
+            DEFERRED_TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if resource.host.is_some() {
+    } else if resource.host.get().is_none_or(Option::is_some) {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -1356,18 +1379,19 @@ fn hand_out_resource(
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// For a texture made for a placed view (`texture_at`): a title texture
-/// the GPU writes (render target, depth or unordered access) at the same
-/// memory, in the same layout and with the same bytes per row and rows
-/// (elements of the same size, block-compressed ones counted in blocks),
-/// that has another host texture: what the GPU wrote there lives in that
-/// one, to be copied over (`texture::alias_copy`).
+/// Finds a GPU-writable texture at the same title address with a separate
+/// host allocation. The layout, row byte size, and row count must match,
+/// counting compressed rows and elements in blocks.
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
-pub(crate) fn alias_source(placed: This) -> Option<This> {
+pub(crate) fn alias_source(placed: This) -> Option<std::sync::Arc<HostTexture>> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
+    if placed.is_null() {
+        return None;
+    }
     let b = resource(placed);
+    let destination = b.host.get()?.as_ref()?;
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = |d: &ResourceDesc| {
         let (size, block) = element(d.format)?;
@@ -1380,21 +1404,28 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .iter()
         .map(|&r| r as This)
         .filter(|&r| r != placed)
-        .find(|&r| {
+        .find_map(|r| {
             let a = resource(r);
-            a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
-                && matches!((&a.host, &b.host), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
+            if a.desc.flags & WRITTEN == 0 || bytes(&a.desc) != Some(want) {
+                return None;
+            }
+            let source = a.host.get()?.as_ref()?;
+            // Keep the host copy alive after releasing the resource map.
+            (!std::sync::Arc::ptr_eq(source, destination)).then(|| source.clone())
         })
 }
 
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        if self.host.get().is_none() {
+            DEFERRED_TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1410,7 +1441,7 @@ impl Drop for Resource {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(h) = &self.host {
+        if let Some(h) = self.host.get().and_then(Option::as_ref) {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
@@ -1601,11 +1632,16 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], unordered: bool) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
+    if unordered {
+        // The placed view itself declares this use. Include it in the
+        // host resource description and cache key.
+        desc[12] |= UNORDERED;
+    }
     let desc = &desc;
     // A resource whose memory's host texture was replaced since (one with
     // more uses) is made again, sharing the new one.
@@ -1635,7 +1671,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).host_texture().is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1850,6 +1886,12 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_null_view_has_no_alias_source() {
+        assert!(alias_source(std::ptr::null()).is_none());
+    }
     use crate::object::slot;
 
     #[test]
@@ -2212,6 +2254,7 @@ mod tests {
             ),
             S_OK
         );
+        assert!(resource(image).host.get().is_none(), "the title texture has no host allocation yet");
         assert_eq!(
             create_committed(
                 null,

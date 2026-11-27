@@ -17,6 +17,267 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// Populate the shared heap ABI's reserved tail with compatible descriptors.
+///
+/// # Safety
+/// The heap must belong to device and its tail must be exclusively reserved.
+/// No GPU work may be using the tail while these descriptors are written.
+pub unsafe fn make_heap_nulls(
+    device: &ID3D12Device,
+    heap: &ID3D12DescriptorHeap,
+    base: u32,
+    sampler: bool,
+) {
+    // SAFETY: the caller owns the reserved slots.
+    unsafe {
+        let kind = if sampler {
+            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+        } else {
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        };
+        let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+        let step = device.GetDescriptorHandleIncrementSize(kind) as usize;
+        let at = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start + (base + slot) as usize * step,
+        };
+        if sampler {
+            for (slot, filter) in [
+                D3D12_FILTER_MIN_MAG_MIP_POINT,
+                D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                device.CreateSampler(
+                    &D3D12_SAMPLER_DESC {
+                        Filter: filter,
+                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        MaxAnisotropy: 1,
+                        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                        ..Default::default()
+                    },
+                    at(slot as u32),
+                );
+            }
+            return;
+        }
+        for slot in 0..super::NULL_VIEWS {
+            let (access, data) = super::null_view_properties(slot);
+            let kind = access & 0xff;
+            if kind == 13 {
+                device.CreateConstantBufferView(None, at(slot));
+                continue;
+            }
+            let format = match (kind, data) {
+                (11, _) => DXGI_FORMAT_R32_TYPELESS,
+                (12, _) => DXGI_FORMAT_UNKNOWN,
+                (_, 4) => DXGI_FORMAT_R32_SINT,
+                (_, 5) => DXGI_FORMAT_R32_UINT,
+                _ => DXGI_FORMAT_R32_FLOAT,
+            };
+            if access & 0x1000 != 0 {
+                let (dim, fields) = match kind {
+                    1 => (
+                        D3D12_UAV_DIMENSION_TEXTURE1D,
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture1D: D3D12_TEX1D_UAV::default(),
+                        },
+                    ),
+                    2 => (
+                        D3D12_UAV_DIMENSION_TEXTURE2D,
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_UAV::default(),
+                        },
+                    ),
+                    4 => (
+                        D3D12_UAV_DIMENSION_TEXTURE3D,
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture3D: D3D12_TEX3D_UAV {
+                                WSize: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    6 => (
+                        D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
+                                ArraySize: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    7 => (
+                        D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                                ArraySize: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    _ => (
+                        D3D12_UAV_DIMENSION_BUFFER,
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: 1,
+                                StructureByteStride: if kind == 12 { data } else { 0 },
+                                Flags: if kind == 11 {
+                                    D3D12_BUFFER_UAV_FLAG_RAW
+                                } else {
+                                    D3D12_BUFFER_UAV_FLAG_NONE
+                                },
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                };
+                device.CreateUnorderedAccessView(
+                    None,
+                    None,
+                    Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: dim,
+                        Anonymous: fields,
+                    }),
+                    at(slot),
+                );
+            } else {
+                let (dim, fields) = match kind {
+                    1 => (
+                        D3D12_SRV_DIMENSION_TEXTURE1D,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture1D: D3D12_TEX1D_SRV {
+                                MipLevels: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    2 => (
+                        D3D12_SRV_DIMENSION_TEXTURE2D,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV {
+                                MipLevels: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    3 => (
+                        D3D12_SRV_DIMENSION_TEXTURE2DMS,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2DMS: D3D12_TEX2DMS_SRV::default(),
+                        },
+                    ),
+                    4 => (
+                        D3D12_SRV_DIMENSION_TEXTURE3D,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture3D: D3D12_TEX3D_SRV {
+                                MipLevels: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    5 => (
+                        D3D12_SRV_DIMENSION_TEXTURECUBE,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            TextureCube: D3D12_TEXCUBE_SRV {
+                                MipLevels: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    6 => (
+                        D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture1DArray: D3D12_TEX1D_ARRAY_SRV {
+                                MipLevels: 1,
+                                ArraySize: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    7 => (
+                        D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                                MipLevels: 1,
+                                ArraySize: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    8 => (
+                        D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV {
+                                ArraySize: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    9 => (
+                        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                                MipLevels: 1,
+                                NumCubes: 1,
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    _ => (
+                        D3D12_SRV_DIMENSION_BUFFER,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                NumElements: 1,
+                                StructureByteStride: if kind == 12 { data } else { 0 },
+                                Flags: if kind == 11 {
+                                    D3D12_BUFFER_SRV_FLAG_RAW
+                                } else {
+                                    D3D12_BUFFER_SRV_FLAG_NONE
+                                },
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                };
+                device.CreateShaderResourceView(
+                    None,
+                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: dim,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: fields,
+                    }),
+                    at(slot),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+const HEAP_BOUNDS_PARAM: windows::core::GUID =
+    windows::core::GUID::from_u128(0x481c3a0f_fc1b_4485_a146_d220c56aef5a);
+
+#[cfg(test)]
+fn bounds_parameter(root: &ID3D12RootSignature) -> Option<u32> {
+    let mut param = 0u32;
+    let mut bytes = size_of::<u32>() as u32;
+    // SAFETY: these output pointers cover the four bytes requested.
+    unsafe {
+        root.GetPrivateData(
+            &HEAP_BOUNDS_PARAM,
+            &mut bytes,
+            Some((&raw mut param).cast()),
+        )
+    }
+    .ok()
+    .map(|_| param)
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -169,7 +430,11 @@ impl Host {
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                let cbvs = s
+                    .root_cbvs
+                    .iter()
+                    .filter(|&&r| r != super::HEAP_BOUNDS)
+                    .map(|&r| (r, 0));
                 let srvs = s.root_srvs.iter().map(|&r| (r, 1));
                 cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
@@ -210,6 +475,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let bounds = stages
+            .iter()
+            .any(|(s, _)| s.root_cbvs.contains(&super::HEAP_BOUNDS))
+            .then(|| {
+                let index = params.len() as u32;
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: super::HEAP_BOUNDS.into(),
+                            RegisterSpace: super::ROOT_CBV_SPACE,
+                            Num32BitValues: super::HEAP_BOUND_WORDS,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                index
+            });
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         // SAFETY: the feature query writes the structure of the given size.
         // Older runtimes may not recognize OPTIONS19; that means no support.
@@ -268,7 +551,20 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature =
+                self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            #[cfg(test)]
+            if let Some(param) = bounds {
+                root.SetPrivateData(
+                    &HEAP_BOUNDS_PARAM,
+                    size_of::<u32>() as u32,
+                    Some((&raw const param).cast()),
+                )
+                .map_err(err)?;
+            }
+            #[cfg(not(test))]
+            let _ = bounds;
+            Ok(root)
         }
     }
 
@@ -963,10 +1259,19 @@ impl Host {
                 .map_err(err)?;
             let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
             dev.CreateRenderTargetView(&target, None, rtv);
+            let bounds_param = bounds_parameter(root);
+            let view_limit = d.textures.len() as u32;
+            let sampler_limit = d.samplers.len() as u32;
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: d.textures.len().max(1) as u32,
+                    NumDescriptors: (view_limit
+                        + if bounds_param.is_some() {
+                            super::NULL_VIEWS
+                        } else {
+                            0
+                        })
+                    .max(1),
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -974,7 +1279,13 @@ impl Host {
             let sampler_heap: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    NumDescriptors: d.samplers.len().max(1) as u32,
+                    NumDescriptors: (sampler_limit
+                        + if bounds_param.is_some() {
+                            super::NULL_SAMPLERS
+                        } else {
+                            0
+                        })
+                    .max(1),
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -1073,6 +1384,17 @@ impl Host {
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
             list.SetGraphicsRootSignature(root);
+            if let Some(param) = bounds_param {
+                make_heap_nulls(dev, &views, view_limit, false);
+                make_heap_nulls(dev, &sampler_heap, sampler_limit, true);
+                let bounds = [view_limit, sampler_limit, view_limit];
+                list.SetGraphicsRoot32BitConstants(
+                    param,
+                    super::HEAP_BOUND_WORDS,
+                    bounds.as_ptr().cast(),
+                    0,
+                );
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
@@ -1251,10 +1573,6 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
-    /// below it.
-    NullBuffers,
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1402,12 +1720,23 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
-                _ => d.views.len(),
-            };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
-            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
+            let bounds_param = bounds_parameter(root);
+            let view_limit = d.views.len() as u32;
+            let sampler_limit = d.samplers.len() as u32;
+            let view_slots = view_limit
+                + if bounds_param.is_some() {
+                    super::NULL_VIEWS
+                } else {
+                    0
+                };
+            let sampler_slots = sampler_limit
+                + if bounds_param.is_some() {
+                    super::NULL_SAMPLERS
+                } else {
+                    0
+                };
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slots as usize)?;
+            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_slots as usize)?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                 as usize;
@@ -1732,37 +2061,6 @@ impl Host {
                         }
                     }
                     View::Pair => {}
-                    View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
-                        let (mut srv_at, mut uav_at) = (at, at);
-                        srv_at.ptr += (null - i) * view_size;
-                        uav_at.ptr += (null - 1 - i) * view_size;
-                        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32_TYPELESS,
-                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                Buffer: D3D12_BUFFER_SRV {
-                                    NumElements: 1,
-                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32_TYPELESS,
-                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                                Buffer: D3D12_BUFFER_UAV {
-                                    NumElements: 1,
-                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        dev.CreateShaderResourceView(None, Some(&srv), srv_at);
-                        dev.CreateUnorderedAccessView(None, None, Some(&uav), uav_at);
-                    }
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
@@ -1772,6 +2070,17 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
+            if let Some(param) = bounds_param {
+                make_heap_nulls(dev, &views, view_limit, false);
+                make_heap_nulls(dev, &samplers, sampler_limit, true);
+                let bounds = [view_limit, sampler_limit, view_limit];
+                list.SetComputeRoot32BitConstants(
+                    param,
+                    super::HEAP_BOUND_WORDS,
+                    bounds.as_ptr().cast(),
+                    0,
+                );
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(

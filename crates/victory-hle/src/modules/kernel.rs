@@ -242,6 +242,8 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    #[cfg(windows)]
+    victory_gpu::finish_pending();
     host::exit(code)
 }
 
@@ -290,6 +292,8 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        #[cfg(windows)]
+        victory_gpu::finish_pending();
     }
     host::terminate_process(process, code)
 }

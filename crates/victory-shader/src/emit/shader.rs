@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -16,19 +16,82 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// parameter) of the view-stride table: dword `i` is the byte stride of
 /// the buffer view at view-heap index `i`.
 pub const VIEW_STRIDES: u8 = 255;
+/// The descriptor is a structured SRV. The other bits hold its byte stride.
+pub const VIEW_STRIDE_STRUCTURED_SRV: u32 = 1 << 31;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// Preferred resource heap size and the D3D12 sampler heap limit.
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
-/// The heap index of the host's null raw buffer view (the null raw
-/// unordered access view at the index below), read instead of a slot that
-/// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+
+/// Internal CBV register for the view and sampler heaps' null bases.
+pub const HEAP_BOUNDS: u8 = 254;
+pub const HEAP_BOUND_WORDS: u32 = 3;
+pub const NULL_SAMPLERS: u32 = 2;
+
+const SRV_TEXTURES: [u32; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+const UAV_TEXTURES: [u32; 5] = [1, 2, 4, 6, 7];
+const TYPED: u32 = 5;
+const UAV_TYPED: u32 = TYPED + 3 * (1 + SRV_TEXTURES.len() as u32);
+pub const NULL_VIEWS: u32 = UAV_TYPED + 3 * (1 + UAV_TEXTURES.len() as u32);
+
+/// DXIL resource properties of the reserved descriptors, in heap order.
+pub fn null_view_properties(slot: u32) -> (u32, u32) {
+    match slot {
+        0 => (11, 0),
+        1 => (11 | 0x1000, 0),
+        2 => (12, 4),
+        3 => (12 | 0x1000, 4),
+        4 => (13, 0),
+        _ => {
+            let (n, dims, access) = if slot < UAV_TYPED {
+                (slot - TYPED, &SRV_TEXTURES[..], 0)
+            } else {
+                (slot - UAV_TYPED, &UAV_TEXTURES[..], 0x1000)
+            };
+            let kind = if n < 3 {
+                10
+            } else {
+                dims[(n / 3 - 1) as usize]
+            };
+            (kind | access, [9, 4, 5][(n % 3) as usize])
+        }
+    }
+}
+
+fn null_offset(props: (u32, u32), sampler: bool) -> u32 {
+    if sampler {
+        return u32::from(props.0 & 0x8000 != 0);
+    }
+    let uav = props.0 & 0x1000 != 0;
+    match props.0 & 0xff {
+        11 => u32::from(uav),
+        12 => 2 + u32::from(uav),
+        13 => 4,
+        kind => {
+            let (base, dims) = if uav {
+                (UAV_TYPED, &UAV_TEXTURES[..])
+            } else {
+                (TYPED, &SRV_TEXTURES[..])
+            };
+            let dimension = if kind == 10 {
+                0
+            } else {
+                1 + dims
+                    .iter()
+                    .position(|&k| k == kind)
+                    .expect("supported heap resource kind") as u32
+            };
+            let component = match props.1 & 0xff {
+                2 | 4 | 6 => 1,
+                3 | 5 | 7 => 2,
+                _ => 0,
+            };
+            base + dimension * 3 + component
+        }
+    }
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -118,6 +181,7 @@ pub(crate) struct Shader {
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
+    heap_bounds: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -128,6 +192,7 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    scan: Option<V>,
     main: V,
     pub entry: usize,
 }
@@ -182,12 +247,14 @@ impl Shader {
             view_marks: None,
             view_writes: None,
             view_index: std::collections::HashMap::new(),
+            heap_bounds: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            scan: None,
             main,
             entry,
         }
@@ -203,6 +270,58 @@ impl Shader {
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g
+    }
+
+    /// A wrapping sum across one 64-thread group. `prefix` selects an
+    /// exclusive/inclusive prefix; None selects the sum of all 64 values.
+    /// Every lane must reach this call together.
+    pub fn group_sum64(&mut self, at: usize, lane: V, input: V, prefix: Option<bool>) -> V {
+        let scratch = *self.scan.get_or_insert_with(|| {
+            let ty = self.m.array(128, self.t.i32);
+            self.m.global("wave64_scan", ty, 3)
+        });
+        let mode = self.m.i32(1 | 8); // group sync and group-shared memory fence
+        let zero = self.m.i32(0);
+        let own = self.m.element(at, scratch, lane);
+        self.m.store(at, own, input);
+        self.op(at, "barrier", Attr::NoDuplicate, self.t.void, 80, &[mode]);
+
+        // A radix-four scan needs only three exchanges. Alternate banks
+        // so stores cannot overwrite another lane's inputs mid-step.
+        let mut sum = input;
+        let mut bank = 0;
+        for distance in [1, 4, 16] {
+            let base = self.m.i32(bank);
+            for multiple in [1, 2, 3] {
+                let offset = self.m.i32(distance * multiple);
+                let lower = self.m.cmp(at, pred::IULT, lane, offset);
+                let previous = self.m.bin(at, Bin::Sub, lane, offset);
+                let previous = self.m.select(at, lower, zero, previous);
+                let previous = self.m.bin(at, Bin::Add, previous, base);
+                let ptr = self.m.element(at, scratch, previous);
+                let value = self.m.load(at, ptr);
+                let value = self.m.select(at, lower, zero, value);
+                sum = self.m.bin(at, Bin::Add, sum, value);
+            }
+            bank ^= 64;
+            let base = self.m.i32(bank);
+            let slot = self.m.bin(at, Bin::Add, lane, base);
+            let ptr = self.m.element(at, scratch, slot);
+            self.m.store(at, ptr, sum);
+            self.op(at, "barrier", Attr::NoDuplicate, self.t.void, 80, &[mode]);
+        }
+        let result = match prefix {
+            Some(true) => sum,
+            Some(false) => self.m.bin(at, Bin::Sub, sum, input),
+            None => {
+                let last = self.m.i32(bank + 63);
+                let ptr = self.m.element(at, scratch, last);
+                self.m.load(at, ptr)
+            }
+        };
+        // Finish reading before a later collective reuses this storage.
+        self.op(at, "barrier", Attr::NoDuplicate, self.t.void, 80, &[mode]);
+        result
     }
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
@@ -290,7 +409,8 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 13, 65536);
+        let size = if slot == HEAP_BOUNDS { 16 } else { 65536 };
+        let h = self.annotate(block, h, 13, size);
         self.root_cbvs.push((slot, h));
         h
     }
@@ -502,6 +622,41 @@ impl Shader {
         )
     }
 
+    fn heap_bound(&mut self, block: usize, word: u32) -> V {
+        let bounds = if let Some(bounds) = self.heap_bounds {
+            bounds
+        } else {
+            let h = self.root_cbv_handle(HEAP_BOUNDS);
+            let row = self.m.i32(0);
+            let bounds = self.op(
+                self.entry,
+                "cbufferLoadLegacy.i32",
+                Attr::ReadOnly,
+                self.t.cbuf_ret,
+                59,
+                &[h, row],
+            );
+            self.heap_bounds = Some(bounds);
+            bounds
+        };
+        self.m.extract(block, bounds, word)
+    }
+
+    /// Direct title heap indices may not address VIctory's scratch slots.
+    pub fn title_view_index(&mut self, block: usize, index: V) -> V {
+        let title_count = self.heap_bound(block, 2);
+        let valid = self.m.cmp(block, pred::IULT, index, title_count);
+        let invalid = self.m.i32(u32::MAX);
+        self.m.select(block, valid, index, invalid)
+    }
+
+    /// Out-of-range metadata reads use the reserved zero/unmarked entry.
+    pub fn view_lookup_index(&mut self, block: usize, index: V) -> V {
+        let limit = self.heap_bound(block, 0);
+        let valid = self.m.cmp(block, pred::IULT, index, limit);
+        self.m.select(block, valid, index, limit)
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -518,11 +673,11 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
-        // An index past the host's heap faults the device (a console shader
-        // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
-        let over = self.m.cmp(block, pred::IUGT, index, last);
-        let index = self.m.select(block, over, last, index);
+        let limit = self.heap_bound(block, u32::from(sampler));
+        let valid = self.m.cmp(block, pred::IULT, index, limit);
+        let offset = self.m.i32(null_offset(props, sampler));
+        let null = self.m.bin(block, Bin::Add, limit, offset);
+        let index = self.m.select(block, valid, index, null);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -538,6 +693,21 @@ impl Shader {
             self.view_index.insert(h, index);
         }
         h
+    }
+
+    pub fn wave_first(&mut self, block: usize, value: V, reduce: bool) -> V {
+        self.flags |= flags::WAVE_OPS;
+        if reduce {
+            // Exactly one active lane contributes its original bits. The
+            // others contribute zero, including in divergent control flow.
+            let first = self.op(block, "waveIsFirstLane", Attr::NoUnwind, self.t.i1, 110, &[]);
+            let zero = self.m.i32(0);
+            let contribution = self.m.select(block, first, value, zero);
+            let or = self.m.i8(1);
+            self.op(block, "waveActiveBit.i32", Attr::NoUnwind, self.t.i32, 120, &[contribution, or])
+        } else {
+            self.op(block, "waveReadLaneFirst.i32", Attr::NoUnwind, self.t.i32, 118, &[value])
+        }
     }
 
     /// The finished container.
@@ -599,7 +769,10 @@ impl Shader {
                     Some(i32c(&mut self, ROOT_CBV_SPACE)),
                     Some(i32c(&mut self, u32::from(slot))),
                     Some(i32c(&mut self, 1)),
-                    Some(i32c(&mut self, 65536)),
+                    Some(i32c(
+                        &mut self,
+                        if slot == HEAP_BOUNDS { 16 } else { 65536 },
+                    )),
                     None,
                 ];
                 cbv_list.push(Some(self.m.md_node(ops)));
@@ -984,5 +1157,23 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod heap_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn every_null_class_has_its_own_in_bounds_slot() {
+        for slot in 0..NULL_VIEWS {
+            assert_eq!(null_offset(null_view_properties(slot), false), slot);
+        }
+        assert_eq!(null_offset((14, 0), true), 0);
+        assert_eq!(null_offset((14 | 0x8000, 0), true), NULL_SAMPLERS - 1);
+        assert_ne!(
+            null_offset((11, 0), false),
+            null_offset((11 | 0x1000, 0), false)
+        );
     }
 }

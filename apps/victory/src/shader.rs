@@ -78,7 +78,12 @@ struct Totals {
     engine: HashMap<u64, String>,
 }
 
-pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> Result<()> {
+pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool, hash: Option<&str>) -> Result<()> {
+    if let Some(hash) = hash
+        && (hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        anyhow::bail!("expected a 16-digit shader hash");
+    }
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
     let mut packs = Vec::new();
@@ -102,7 +107,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                 list_effects(path, &data);
                 continue;
             }
-            if data.starts_with(shaderpack::MAGIC) {
+            if hash.is_none() && data.starts_with(shaderpack::MAGIC) {
                 packs.push((path.to_owned(), data));
                 continue;
             }
@@ -120,6 +125,13 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                if let Some(hash) = hash {
+                    // Container::parse has verified the declared length.
+                    let len = u32::from_le_bytes(bytes[0x18..0x1c].try_into()?) as usize;
+                    if !blake3::hash(&bytes[..len]).to_hex()[..16].eq_ignore_ascii_case(hash) {
+                        continue;
+                    }
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);
@@ -219,6 +231,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
             }
             t.files_with_shaders += usize::from(found_here > 0);
         }
+    }
+    if let Some(hash) = hash
+        && t.containers == 0
+    {
+        anyhow::bail!("shader {hash} not found");
     }
     println!(
         "containers found       {} (in {} files)",

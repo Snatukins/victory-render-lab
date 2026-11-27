@@ -221,6 +221,102 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 }
 
 #[test]
+fn cross_boundary_stores_mark_the_pages_named_by_the_table() {
+    let mut words = vec![v_mov_b32(0, ZERO)];
+    words.extend((1..=4).map(|i| v_mov_b32(i, ZERO + u16::from(i))));
+    words.extend(global(30, 0, 0, 1, 0, 0)); // global_store_dwordx4
+    words.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 5,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let l = lower::lower(&lower::Parts {
+        native: &native, p: &p, st: &st, io: &io, res: &res,
+        inputs: Vec::new(), outputs: Vec::new(), prims: Vec::new(),
+        mesh_stride: 0, view_marks: false,
+    }).unwrap();
+    assert!(l.memory && l.memory_writes);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).unwrap();
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(true).or_else(|_| Host::new(false)).expect("SM 6.6 test device");
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    const BLOCK: usize = 4096;
+    let memory = vec![0u32; (2 << 16) / 4];
+    for (address, second_block) in [
+        (0x1_0fff_fff8u64, 1usize),
+        (0x1_ffff_fff8, 1),
+        (0x1_0fff_fff8, 0),
+    ] {
+        let mut table = vec![0; 7 * BLOCK];
+        for entry in table[BLOCK..].chunks_exact_mut(2) {
+            entry[0] = 2; // null SRV/UAV pair
+        }
+        let first_region = (address >> 28) as usize;
+        table[first_region] = 2;
+        table[first_region + 1] = second_block as u32;
+        let first = 3 * BLOCK - 1;
+        let second = if second_block == 0 { first_region + 1 } else { second_block * BLOCK };
+        let start = address as u32 & !0xffff;
+        for index in [first, second].into_iter().filter(|&i| i >= BLOCK) {
+            table[BLOCK + index * 2..BLOCK + index * 2 + 2].copy_from_slice(&[0, start]);
+        }
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            constants[u.index as usize] = (address >> (32 * u.dword)) as u32;
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![
+                (0, Root::Constants(constants)),
+                (1, Root::View { srv: true, data: table }),
+                (2, Root::Uav((3 * BLOCK / 32) as u32)),
+            ],
+            views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).unwrap();
+        assert_eq!(&out[0][0x3ffe..0x4002], &[1, 2, 3, 4]);
+        let bits = (0..3 * BLOCK)
+            .filter(|&b| out[1][b / 32] >> (b % 32) & 1 != 0)
+            .collect::<Vec<_>>();
+        assert_eq!(bits, [second, first], "store at {address:#x}");
+    }
+}
+
+#[test]
 fn title_memory_is_read_and_written_at_computed_addresses() {
     let shader = program();
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -592,7 +688,7 @@ fn writes_through_views_mark_their_pages() {
                 &pso,
                 &Dispatch {
                     roots: vec![
-                        (0, Root::Constants(ud)),
+                        (0, Root::Constants(ud.clone())),
                         (1, Root::View { srv: true, data: marks.clone() }),
                         (2, Root::Uav(8)),
                     ],
@@ -609,6 +705,43 @@ fn writes_through_views_mark_their_pages() {
             .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
             .collect();
         assert_eq!(marked, [100, 101, 200], "{label}: pages");
+        // Slot 2 now begins the reserved tail. The attempted atomic must
+        // target the null UAV and must not set a bit or mutate either view.
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: vec![
+                                    100,
+                                    0xFFF0,
+                                    super::VIEW_MARK_NONE,
+                                    0,
+                                    super::VIEW_MARK_NONE,
+                                    0,
+                                ],
+                            },
+                        ),
+                        (2, Root::Uav(8)),
+                    ],
+                    views: &[View::RawUav(8), View::RawUav(8)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[0], [value, 0, 0, value, value, value, value, 0]);
+        assert_eq!(out[1], [0, value, 0, 0, 0, 0, 0, 0]);
+        let marked: Vec<_> = (0..out[2].len() * 32)
+            .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
+            .collect();
+        assert_eq!(marked, [100, 101], "{label}: pages on the smaller heap");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

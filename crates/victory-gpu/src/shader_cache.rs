@@ -19,17 +19,32 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use victory_pipeline::{Cache, Converter};
+use victory_pipeline::{Cache, CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
+static COMPATIBLE_CACHE: OnceLock<(Cache, [u8; 32])> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+
+mod compat;
 
 /// Keeps translated shaders in a folder of `dir` from now on: the folder
 /// of this translator, `None` if it cannot be opened.
 pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
+    if let Some(previous) = compat::previous_key(
+        victory_shader::SOURCE_HASH,
+        blake3::hash(ENCODING),
+        victory_shader::emit::loop_limit(),
+        wave32_only(),
+    ) {
+        let path = dir.join(&blake3::Hash::from(previous).to_hex()[..16]);
+        if path.is_dir() && let Ok(cache) = Cache::open(&path) {
+            tracing::info!(dir = %path.display(), "reusing compatible shader cache entries");
+            let _ = COMPATIBLE_CACHE.set((cache, previous));
+        }
+    }
     let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
     match Cache::open(&dir) {
         Ok(cache) => {
@@ -64,32 +79,89 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, wave32_only())
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, wave32_only: bool) -> [u8; 32] {
+    key_with_encoding_hash(translator, blake3::hash(encoding), limit, wave32_only)
+}
+
+fn key_with_encoding_hash(translator: &str, encoding: blake3::Hash, limit: u32, wave32_only: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
-    h.update(blake3::hash(encoding).as_bytes());
+    h.update(encoding.as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&[u8::from(wave32_only)]);
     *h.finalize().as_bytes()
+}
+
+fn wave32_only() -> bool {
+    #[cfg(windows)]
+    { crate::host::host().is_some_and(|host| host.wave32_only()) }
+    #[cfg(not(windows))]
+    { false }
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    let wave32_only = wave32_only();
+    let compute_wave_first_reduce = wave32_only && needs_wave_first_reduction(container);
+    if !compute_wave_first_reduce
+        && let Some((cache, build)) = COMPATIBLE_CACHE.get()
+        && let Some(shader) = compatible_entry(cache, build, container)
+    {
+        HITS.fetch_add(1, Ordering::Relaxed);
+        return (shader, true);
+    }
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate = |container: &[u8]| {
+        let options = victory_shader::emit::Options {
+            view_marks: true,
+            wave32_only,
+            wave64_group_collectives: wave32_only && bvh_rehydration(container),
+            compute_wave_first_reduce,
+        };
+        victory_shader::emit::translate_with(container, options).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
     }
+}
+
+fn needs_wave_first_reduction(container: &[u8]) -> bool {
+    matches!(
+        blake3::hash(container).to_hex().as_str(),
+        "23d507cbb6a22e869a99f3b549d422f2b44c3ab1aa7265406399784735cce367"
+            | "b0095eb50222e808880d4fadf70b8e402326c4b68e6110c51a67c0e0c1ad1322"
+    )
+}
+
+fn compatible_entry(cache: &Cache, build: &[u8; 32], container: &[u8]) -> Option<Result<HostShader, String>> {
+    let input = [&build[..], container].concat();
+    let converter = Translate {
+        translate: |_: &[u8]| unreachable!("compatible cache is read-only"),
+        ran: AtomicBool::new(false),
+    };
+    let path = cache.path_for(&CacheKey::new(&converter, &input));
+    std::fs::read(path).ok().and_then(|bytes| decode(&bytes))
+}
+
+/// Box16Rehydration and Box32Rehydration use lane-private LDS and three
+/// converged integer collectives in their first block. Scope the lowering to
+/// the inspected versions so a future shader cannot rely on that LDS assumption.
+fn bvh_rehydration(container: &[u8]) -> bool {
+    matches!(
+        blake3::hash(container).to_hex().as_str(),
+        "caa78b8ca62bc3d68d8de4d3fe00f4219786282c01abaac51621a12b38c61eca"
+            | "28918b7150a7aad583605d88eeb89181aada834a36e8864d7140fa9556afd9e0"
+    )
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -150,7 +222,7 @@ fn cached(
     ((converter.translate)(container), false)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -405,7 +477,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(
             cached(&cache, &build, container, translate),
@@ -435,17 +507,19 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                wave32_only()
             )
         );
         // The encoding part is this file as built.
@@ -474,7 +548,7 @@ mod tests {
         assert_eq!(decode(&bytes), Some(Ok(shader())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
-        assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode(b"VSH1"), None);
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);

@@ -252,9 +252,9 @@ impl Uploads {
 /// there. Copying back the whole unordered ranges after every submission
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
-pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    for (shadow, address, len, _) in viewed.ranges() {
-        add(&shadow, address as usize, len as usize);
+pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize, bool)) {
+    for (shadow, address, len, uav) in viewed.ranges() {
+        add(&shadow, address as usize, len as usize, uav);
     }
 }
 
@@ -602,7 +602,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 list.list.SetPipelineState(&pso);
                 list.list.Dispatch(4, 1, 1);
             }
-            list.defer_heap(&heap_host.viewed);
+            list.defer_heap(&heap_host.viewed, true);
             list.close();
             // The title writes after recording, before submitting.
             write(base, texel);

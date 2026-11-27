@@ -195,10 +195,14 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Guards the other mappings of taken pages.
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
+/// Guards the other mappings and returns pages with an alias still open.
+fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
+    if pairs.is_empty() {
+        return BTreeSet::new();
+    }
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    protect(g, &others);
+    let guarded: BTreeSet<_> = protect(g, &others).into_iter().collect();
+    pairs.iter().filter_map(|&(p, a)| (!guarded.contains(&a)).then_some(p)).collect()
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -285,6 +289,19 @@ fn open(g: &mut Guards, page: usize) -> bool {
 }
 
 impl Tracked {
+    /// The host copy was changed without updating title memory.
+    pub(crate) fn invalidate(&self, from: usize, to: usize) {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from < to {
+            self.changed.0.lock().unwrap_or_else(|e| e.into_inner())
+                .extend(from / PAGE..to.div_ceil(PAGE));
+        }
+    }
+
+    pub(crate) fn has_changes(&self) -> bool {
+        !self.changed.0.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// Takes the changed pages of `[from, to)`: guards them (writes from
     /// now on mark them again) and returns the byte ranges to copy, cut to
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
@@ -305,7 +322,7 @@ impl Tracked {
         if pages.is_empty() {
             return Vec::new();
         }
-        let whole: Vec<usize> = pages
+        let mut whole: Vec<usize> = pages
             .iter()
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
@@ -321,9 +338,10 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
-        guard_aliases(&mut g, &others);
+        let open_aliases = guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
         drop(asked);
+        whole.retain(|p| !open_aliases.contains(p));
         for page in protect(&mut g, &whole) {
             changed.remove(&page);
             self.changed.taken(page);
@@ -350,19 +368,6 @@ impl Tracked {
             .contains(&page)
     }
 
-    /// The caller made pages (page numbers) of its copy equal to title
-    /// memory itself (what shaders wrote went back): taken and guarded.
-    pub(crate) fn taken(&self, pages: &[usize]) {
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
-        guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
-            changed.remove(&page);
-            self.changed.taken(page);
-        }
-    }
-
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
     /// pages there written next after they were taken have their bytes kept
     /// first ([`Tracked::saved`]).
@@ -387,9 +392,26 @@ impl Tracked {
     }
 
     /// The bytes page `page` (a page number) held when it was first written
-    /// since it was taken, if it was armed then (and so changed).
+    /// since it was taken, with any later partial refreshes applied.
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
+    }
+
+    /// A partial refresh changes the copy's before-image for marked writes.
+    pub(crate) fn refreshed(&self, mut from: usize, mut bytes: &[u8]) {
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.bytes.is_empty() {
+            return;
+        }
+        while !bytes.is_empty() {
+            let offset = from % PAGE;
+            let len = (PAGE - offset).min(bytes.len());
+            if let Some(before) = saved.bytes.get_mut(&(from / PAGE)) {
+                before[offset..offset + len].copy_from_slice(&bytes[..len]);
+            }
+            from += len;
+            bytes = &bytes[len..];
+        }
     }
 }
 
@@ -460,26 +482,35 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
+    let guarded = g.protected.range(first..last).next().is_some();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
+    // Save every baseline while the original mapping and its aliases are
+    // still protected. Once any is opened, another CPU writer can land.
+    mark_changed(g, first, last, save);
+    for &page in &others {
+        mark_changed(g, page, page + 1, save);
+    }
+    open_guarded(g, first, last);
     for page in others {
-        changed_here(g, page, page + 1, save);
+        open_guarded(g, page, page + 1);
     }
     guarded
 }
 
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
-/// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     for &page in &guarded {
         open(g, page);
     }
+}
+
+/// Marks the range dirty and saves armed before-images while guarded.
+fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
@@ -490,7 +521,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -559,6 +589,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+    drop(g);
+    crate::shadow::note_mapping_change(at, len);
 }
 
 /// The runtime mapped the page at `at` where `others` show it already: the
@@ -576,8 +608,11 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             }
         }
     }
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
-        protect(&mut g, &[page]);
+    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
+        && protect(&mut g, &[page]).is_empty()
+    {
+        // A writer may already be using this mapping; its old bytes are lost.
+        changed(&mut g, page, page + 1, false);
     }
 }
 
@@ -818,6 +853,23 @@ pub(crate) mod tests {
             title_memory_aliased(b + k, &[a + k]);
         }
         (a, b)
+    }
+
+    #[test]
+    fn busy_alias_keeps_the_page_dirty_and_its_before_image() {
+        let (a, b) = twin_views(1);
+        let tracked = track(a, PAGE, true).expect("mapped views are tracked");
+        assert_eq!(tracked.take(a, a + PAGE), [(a, a + PAGE)]);
+        tracked.arm(a, a + PAGE);
+        let write = writing(b, 1);
+        // SAFETY: the alias remains writable while the write guard lives.
+        unsafe { (b as *mut u8).write_volatile(42) };
+        assert_eq!(tracked.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(tracked.changed(a / PAGE));
+        drop(write);
+        assert_eq!(tracked.saved(a / PAGE).unwrap()[0], 0);
+        assert_eq!(tracked.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(!tracked.changed(a / PAGE));
     }
 
     /// A write through another mapping of the same pages marks the tracker

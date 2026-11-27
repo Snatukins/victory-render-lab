@@ -84,6 +84,83 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+const STARTUP_LOW_BYTES: usize = 192 * MIB;
+static STARTUP_LOW: Mutex<Option<StartupPlaceholder>> = Mutex::new(None);
+
+struct StartupPlaceholder {
+    base: usize,
+    len: usize,
+}
+
+impl StartupPlaceholder {
+    fn take(&mut self, size: usize) -> Option<*mut c_void> {
+        if size == 0 || size > self.len || !size.is_multiple_of(PAGE) {
+            return None;
+        }
+        let base = self.base as *mut c_void;
+        // SAFETY: we own the placeholder. Splitting leaves two reservations,
+        // so no other allocator can take the title's part during the handoff.
+        if size < self.len
+            && unsafe { VirtualFree(base, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0
+        {
+            return None;
+        }
+        self.base += size;
+        self.len -= size;
+        Some(base)
+    }
+}
+
+impl Drop for StartupPlaceholder {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            // SAFETY: only the unclaimed remainder belongs to us.
+            unsafe { VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE) };
+        }
+    }
+}
+
+/// Keeps an uncommitted low-address window available across title startup.
+pub struct StartupLowMemory(());
+
+pub fn reserve_startup_low_memory() -> Option<StartupLowMemory> {
+    let mut slot = STARTUP_LOW.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return None;
+    }
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        HighestEndingAddress: u32::MAX as usize as *mut c_void,
+        ..Default::default()
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: a reservation only, with a live address-requirements parameter.
+    let base = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null_mut(),
+            STARTUP_LOW_BYTES,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            &mut parameter,
+            1,
+        )
+    };
+    if base.is_null() {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not reserve early 32-bit placeholder");
+        return None;
+    }
+    *slot = Some(StartupPlaceholder { base: base as usize, len: STARTUP_LOW_BYTES });
+    Some(StartupLowMemory(()))
+}
+
+impl Drop for StartupLowMemory {
+    fn drop(&mut self) {
+        STARTUP_LOW.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -110,7 +187,8 @@ pub extern "system" fn XMemVirtualAlloc(
     // shortcut: committing part of such a reservation later would fail
     // (Grand Theft Auto VI's 23 calls never do); replace that part of the
     // placeholder then.
-    let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
+    let placeholder = kind & MEM_COMMIT == 0
+        && (kind & PAGES_64K == PAGES_64K || kind & MEM_RESERVE_PLACEHOLDER != 0);
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
             // Part of a placeholder the title split: it stays one.
@@ -136,9 +214,19 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
-    // SAFETY: the title's own arguments, cleaned of console bits; the
-    // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    // Keep the early window for large relocatable placeholders. Smaller
+    // reservations and fixed-address requests still use their usual path.
+    let early = (constrained && placeholder && flags & ADDRESS_32BIT != 0 && size >= 128 * MIB)
+        .then(|| {
+            let mut slot = STARTUP_LOW.lock().unwrap_or_else(|e| e.into_inner());
+            let base = slot.as_mut()?.take(size)?;
+            slot.take(); // Return the unclaimed tail to Windows.
+            tracing::info!(?base, size, "using early 32-bit placeholder");
+            Some(base)
+        })
+        .flatten();
+    let at = early.unwrap_or_else(|| unsafe {
+        // SAFETY: the title's arguments, with a live address-requirements parameter.
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -152,7 +240,7 @@ pub extern "system" fn XMemVirtualAlloc(
             },
             constrained.into(),
         )
-    };
+    });
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -160,12 +248,18 @@ pub extern "system" fn XMemVirtualAlloc(
         } else {
             tracing::warn!(
                 size,
+                base = ?base,
                 kind = format_args!("{kind:#x}"),
                 flags = format_args!("{flags:#x}"),
                 %error,
                 "XMemVirtualAlloc refused"
             );
         }
+    }
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        // A previously reserved range may have lost its GPU-side loose
+        // copy while uncommitted. Recheck it before a later submission.
+        victory_gpu::title_memory_remapped(at as usize, size);
     }
     if base.is_null() {
         tracing::debug!(
@@ -333,7 +427,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            let queried = VirtualQueryEx(GetCurrentProcess(), address, &mut info, size_of::<MEMORY_BASIC_INFORMATION>());
+            if VirtualFree(address, 0, MEM_RELEASE) != 0 && queried != 0 {
+                victory_gpu::title_memory_remapped(address as usize, info.RegionSize);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -606,6 +704,14 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Classify a failed physical-page write without exposing title addresses.
+pub(crate) fn page_write_failure(pages: &[usize]) -> (usize, usize) {
+    let physical = physical();
+    let zero = pages.iter().filter(|&&page| page == 0).count();
+    let unknown = pages.iter().filter(|&&page| page != 0 && !physical.pages.contains_key(&page)).count();
+    (zero, unknown)
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -680,7 +786,9 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
+    if !unmap(&mut physical, base, n * PAGE) {
+        return std::ptr::null_mut();
+    }
     if pages.is_null() {
         return address;
     }
@@ -747,7 +855,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    unmap(&mut physical, to, len);
+    if !unmap(&mut physical, to, len) {
+        return false;
+    }
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -884,12 +994,12 @@ fn commit_limit_message(
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
-fn unmap(physical: &mut Physical, base: usize, len: usize) {
+fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
-        return;
+        return true;
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -905,9 +1015,24 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
+        let Some(&(size, _)) = physical.views.get(&at) else {
             continue;
         };
+        // SAFETY: a view we mapped; it becomes a placeholder again.
+        let unmapped = unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+        if unmapped == 0 {
+            tracing::warn!(size, error = %std::io::Error::last_os_error(), "unmapping physical pages failed");
+            return false;
+        }
+        let (_, slice) = physical.views.remove(&at).expect("view is still registered");
         for k in 0..size / PAGE {
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {
@@ -918,24 +1043,16 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
-        if at < base {
-            map(physical, at, base - at, slice.clone());
-        }
-        if at + size > end {
+        let prefix = at >= base || map(physical, at, base - at, slice.clone());
+        let suffix = at + size <= end || {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map(physical, end, at + size - end, Slice { index, ..slice })
+        };
+        if !prefix || !suffix {
+            return false;
         }
     }
+    true
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -1054,6 +1171,29 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn startup_placeholder_hands_off_a_low_aligned_reservation() {
+        for kind in [PAGES_64K, MEM_RESERVE_PLACEHOLDER] {
+            let _startup = reserve_startup_low_memory().expect("early low reservation");
+            let expected = STARTUP_LOW.lock().unwrap().as_ref().unwrap().base;
+            let size = 185 * MIB;
+            let base = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                kind | MEM_RESERVE,
+                GRAPHICS | ADDRESS_32BIT,
+                PAGE_NOACCESS,
+            );
+            assert_eq!(base as usize, expected);
+            assert_eq!(expected % PAGE, 0);
+            assert!(expected + size <= 1 << 32);
+            assert_eq!(query(base).host.RegionSize, size);
+            assert!(STARTUP_LOW.lock().unwrap().is_none());
+            // SAFETY: the title now owns this independently releasable placeholder.
+            assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        }
     }
 
     #[test]

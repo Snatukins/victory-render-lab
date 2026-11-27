@@ -42,6 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    discord_presence: bool,
 ) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -50,6 +51,9 @@ pub fn run(
     if execute {
         check_cpu_features()?;
     }
+    let _startup_low = execute
+        .then(victory_hle::modules::xmem::reserve_startup_low_memory)
+        .flatten();
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
@@ -186,11 +190,28 @@ pub fn run(
     }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-    let code = main
-        .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    if discord_presence && let Err(error) = start_discord_presence() {
+        tracing::warn!(%error, "could not start Discord Rich Presence");
+    }
+    let result = main.join();
+    victory_gpu::finish_pending();
+    let code = result.map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(code)
+}
+
+#[cfg(windows)]
+fn start_discord_presence() -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let helper = std::env::current_exe()?.with_file_name("vi-rpc.exe");
+    Command::new(&helper)
+        .arg("--exit-with-game")
+        .current_dir(helper.parent().expect("the executable has a folder"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 #[cfg(windows)]
@@ -545,6 +566,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: bool) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

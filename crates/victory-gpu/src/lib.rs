@@ -65,7 +65,7 @@ mod twin;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{finish_pending, on_failure};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,

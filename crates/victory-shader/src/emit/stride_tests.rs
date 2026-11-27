@@ -244,7 +244,9 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         View::RawUav(32),
         View::Buffer {
             data: &data,
-            stride: Stride::Structured(12),
+            // The shader reads bytes from a raw SRV. The 12-byte title
+            // stride comes from the separate stride table below.
+            stride: Stride::Raw,
         },
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -315,7 +317,7 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         32,
     );
     let texel = [[1.0f32, 2.0, 3.0, 4.0]];
-    let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
+    let views = [View::RawUav(32), View::Texture(1, 1, &texel)];
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -333,20 +335,88 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             // The texture at heap index 1, the UAV's table at 0.
             ud[u.index as usize] = u32::from(u.root == RootType::Constants);
         }
-        let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
-            views: &views,
-            samplers: &[],
-            groups: [1, 1, 1],
-        };
-        let words = host
-            .dispatch(&root, &pso, &dispatch)
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(words[0], [0; 32], "{label}");
+        // The same shader and pipeline see slot 1 as valid with two
+        // ordinary slots and out of bounds with just one.
+        for (bound_views, strides) in [(&views[..], vec![4, 0, 0]), (&views[..1], vec![4, 0])] {
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud.clone())),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: strides,
+                                },
+                            ),
+                        ],
+                        views: bound_views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], [0; 32], "{label}, capacity {}", bound_views.len());
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A scalar byte load can read a structured table SRV. A byte offset of
+/// 12 selects the second dword of record 1 in a buffer of eight-byte records.
+#[test]
+fn a_scalar_load_reads_a_structured_table_buffer() {
+    let words = [
+        0xBE86_0300, 0xBE87_0380, // s[6:7] = SRV table
+        0xF408_0203, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0
+        0xBE8C_0302, 0xBE8D_0380, // s[12:13] = UAV table
+        0xF408_0406, 0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0
+        0xBF8C_C07F,
+        0xF420_0504, 0xFA00_000C, // s_buffer_load_dword s20, s[8:11], 12
+        0xBF8C_C07F,
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000, 0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+        0xBF81_0000,
+    ];
+    let mut srv = entry(ResourceType::Srv, 4, 0);
+    srv.stride = 8;
+    let shader = build(
+        &words,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![srv, entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let _lock = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let mut ud = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        // The SRV table starts at heap slot 0, the UAV table at slot 1.
+        ud[u.index as usize] = u32::from(u.slot == 2) * 32;
+    }
+    for (view, layout) in [
+        (Stride::Structured(8), 8 | super::VIEW_STRIDE_STRUCTURED_SRV),
+        (Stride::Raw, 4),
+    ] {
+        let words = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![
+                (0, Root::Constants(ud.clone())),
+                (1, Root::View { srv: true, data: vec![layout, 4, 0] }),
+            ],
+            views: &[
+                View::Buffer { data: &[10, 20, 30, 40, 50, 60], stride: view },
+                View::RawUav(32),
+            ],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).unwrap();
+        assert_eq!(words[0], [40; 32]);
+    }
 }
 
 /// Constant data through the resource heap itself is read from a raw view

@@ -519,6 +519,10 @@ impl State {
         if let Some(value) = value
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
+            #[cfg(feature = "diagnostics")]
+            if let Value::Pad(pad) = &value {
+                tracing::debug!(device = index, buttons = format_args!("{:#x}", pad.buttons), "gamepad state changed");
+            }
             slot.sequence += 1;
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();

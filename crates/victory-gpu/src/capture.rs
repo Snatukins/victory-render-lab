@@ -247,9 +247,40 @@ thread_local! {
 
 /// Names the pipeline whose views this thread binds next (empty: none).
 pub(crate) fn binding(pipeline: &str) {
-    if dump_on() {
+    if dump_on() || !readers().is_empty() {
         WRITER.with(|w| pipeline.clone_into(&mut w.borrow_mut()));
     }
+}
+
+/// `VICTORY_DUMP_READERS`: dump the texture SRVs read by these shader
+/// hashes at the end of a listed frame.
+fn readers() -> &'static [String] {
+    static READERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    READERS.get_or_init(|| {
+        if folder().is_none() {
+            return Vec::new();
+        }
+        std::env::var("VICTORY_DUMP_READERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)
+            .collect()
+    })
+}
+
+pub(crate) fn note_input(resource: crate::object::This) {
+    let readers = readers();
+    if readers.is_empty() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    WRITER.with(|pipeline| {
+        let pipeline = pipeline.borrow();
+        if readers.iter().any(|hash| pipeline.contains(hash)) {
+            keep_target(resource, format!("input {pipeline}"));
+        }
+    });
 }
 
 pub(crate) fn dump_on() -> bool {
@@ -296,8 +327,14 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
             return;
         }
     }
+    keep_target(resource, by);
+}
+
+fn keep_target(resource: crate::object::This, by: String) {
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
+    if !targets.iter().any(|(r, _, writer)| {
+        *r == resource as usize && writer.starts_with("input ") == by.starts_with("input ")
+    })
         && let Some(copy) = crate::resource::host_copy(resource)
     {
         targets.push((resource as usize, copy, by));

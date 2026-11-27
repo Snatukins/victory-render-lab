@@ -19,6 +19,8 @@
 //! not.
 
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -49,15 +51,25 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
-    last: Mutex<Last>,
+    last: Mutex<Option<blake3::Hash>>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
-#[derive(Default)]
-struct Last {
-    hash: Option<blake3::Hash>,
-    read: Vec<u8>,
+/// Tiled bytes are needed only while detiling, never by the recorded GPU copy.
+static TILED_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+const MAX_TILED_SCRATCH: usize = 16 << 20;
+#[cfg(feature = "diagnostics")]
+static STAGING_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn trim_scratch(available: usize) {
+    if available < 2 << 30 && let Ok(mut scratch) = TILED_SCRATCH.try_lock() {
+        *scratch = Vec::new();
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_usage() -> (u64, usize) {
+    let scratch = TILED_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    (STAGING_BYTES.load(Ordering::Relaxed), scratch.capacity())
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -90,30 +102,30 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Records, once per list, the copy of `from`'s host texture into `to`'s:
+/// Records, once per list, a copy from a GPU-written alias into `to`:
 /// two title textures at one memory that cannot share a host texture
 /// (`resource::alias_source`: block-compressed against plain formats of
-/// the same bytes, or a cast the host refused), `to` (a placed view's)
-/// reading what the GPU wrote through `from`. Through a buffer, each
+/// the same bytes, or a cast the host refused), so sampling and copying
+/// read what the GPU wrote. Through a buffer, each
 /// subresource with its own format, as many as have the same bytes per
 /// row and rows in both; `to` no longer takes its contents from title
 /// memory.
-pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
+pub(crate) fn alias_copy(list: &HostList, resource: This, to: &Arc<crate::resource::HostTexture>) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
-        crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
-        host(),
-    ) else {
+    let (Some(from), Some(host)) = (crate::resource::alias_source(resource), host()) else {
         return;
     };
+    let (a, b) = (&from.texture, &to.texture);
     // An odd key: textures' own first uses are keyed by the host texture.
-    if !list.first_use(to as usize | 1) {
+    if !list.first_use(Arc::as_ptr(to) as usize | 1) {
         return;
     }
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
+    if da.SampleDesc.Count != 1 || db.SampleDesc.Count != 1 {
+        return;
+    }
     let count = |d: &D3D12_RESOURCE_DESC| {
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
             u32::from(d.MipLevels)
@@ -124,22 +136,35 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let footprints = |d: &D3D12_RESOURCE_DESC, n: u32| {
         let mut f = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
         let mut rows = vec![0u32; n as usize];
+        let mut row_bytes = vec![0u64; n as usize];
         let mut total = 0;
         // SAFETY: outputs sized for `n` subresources.
         unsafe {
-            host.device
-                .GetCopyableFootprints(d, 0, n, 0, Some(f.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+            host.device.GetCopyableFootprints(
+                d,
+                0,
+                n,
+                0,
+                Some(f.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                Some(row_bytes.as_mut_ptr()),
+                Some(&mut total),
+            );
         }
-        (f, rows, total)
+        (f, rows, row_bytes, total)
     };
-    let (fa, ra, total) = footprints(&da, count(&da));
-    let (fb, rb, _) = footprints(&db, count(&db));
+    let (fa, ra, sa, total) = footprints(&da, count(&da));
+    let (fb, rb, sb, _) = footprints(&db, count(&db));
     // Subresources in order while both have the same bytes there (mips of
     // a block-compressed texture past its last whole block do not).
     let n = (0..fa.len().min(fb.len()))
         .take_while(|&i| {
             let (x, y) = (fa[i], fb[i]);
-            x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
+            x.Offset == y.Offset
+                && x.Footprint.RowPitch == y.Footprint.RowPitch
+                && ra[i] == rb[i]
+                && sa[i] == sb[i]
+                && x.Footprint.Depth == y.Footprint.Depth
         })
         .count() as u32;
     if n == 0 {
@@ -148,9 +173,10 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_written(to);
-    crate::list::ensure_state(list, from, COPY_SOURCE);
-    crate::list::ensure_state(list, to, COPY_DEST);
+    to.host_written
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::list::ensure_copy_state(list, &from, COPY_SOURCE);
+    crate::list::ensure_copy_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the copy does not release.
         pResource: unsafe { std::mem::transmute_copy(r) },
@@ -181,9 +207,10 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-    if logged.len() < 64 && !logged.contains(&(from as usize, to as usize)) {
-        logged.push((from as usize, to as usize));
-        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
+    let pair = (a.as_raw() as usize, b.as_raw() as usize);
+    if logged.len() < 64 && !logged.contains(&pair) {
+        logged.push(pair);
+        tracing::info!(from = ?a.as_raw(), to = ?resource, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
     }
 }
 
@@ -301,16 +328,32 @@ impl Staging {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let last = &mut *last;
         if let Some(t) = &self.tracked {
+            if !t.has_changes() {
+                return (0, false);
+            }
+            let mut pooled;
+            let mut large = Vec::new();
+            let read = if size <= MAX_TILED_SCRATCH {
+                pooled = TILED_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+                &mut *pooled
+            } else {
+                &mut large
+            };
+            // Reserve before taking dirty pages. On failure the same data
+            // remains dirty and can be uploaded during a later submission.
+            if read.try_reserve_exact(size.saturating_sub(read.len())).is_err() {
+                once!(size, "could not allocate texture detile scratch");
+                return (0, false);
+            }
             if t.take(start, start + size).is_empty() {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            read.resize(size, 0);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
@@ -330,10 +373,10 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if *last == Some(hash) {
             return (size, false);
         }
-        last.hash = Some(hash);
+        *last = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -369,6 +412,13 @@ impl Staging {
                 return;
             }
         }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Staging {
+    fn drop(&mut self) {
+        STAGING_BYTES.fetch_sub(self.size, Ordering::Relaxed);
     }
 }
 
@@ -479,6 +529,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
     });
+    #[cfg(feature = "diagnostics")]
+    STAGING_BYTES.fetch_add(total, Ordering::Relaxed);
     *held = Some(s.clone());
     Some(s)
 }

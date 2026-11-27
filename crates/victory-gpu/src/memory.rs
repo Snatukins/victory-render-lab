@@ -10,8 +10,8 @@
 //!
 //! Each view heap has one page table, which every list using title memory
 //! with that heap bound reads, and each host copy has a pair of views in
-//! slots of the heap kept for it while it lives ([`HostHeap::pair`], past
-//! the per-draw dynamic slots). At each submission with such a list the
+//! slots of the heap kept while the table names it ([`HostHeap::pair`]).
+//! At each submission with such a list the
 //! table is rewritten if copies came or went since, and every copy it names
 //! is brought up to date (page by page, as every refresh; once per
 //! submission until a step writes title memory). Shaders mark the pages
@@ -19,7 +19,7 @@
 //! goes back into title memory ([`crate::shadow::Shadow::copy_back_page`])
 //! and the bitmap is cleared.
 //!
-//! Cost per submission with such a list: one change check of every host
+//! Cost per submission with such a list: one change check of each named
 //! copy (the refresh), copies of the pages the title wrote, a compare of
 //! each 64 KiB page shaders wrote, and the table's rewrite when copies came
 //! or went (two views per new copy); per list a bitmap of 256 KiB.
@@ -33,9 +33,12 @@
 //! past that, the smallest copies read as missing (logged once).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex, Weak};
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::{ID3D12DescriptorHeap, ID3D12Resource};
 
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
@@ -57,9 +60,121 @@ pub(crate) struct Map {
     pub(crate) table: u64,
     /// The list's page bitmap's host GPU address (the root UAV).
     pub(crate) dirty: u64,
-    /// Ranges that go back byte for byte instead (root UAVs, see
-    /// [`Map::precise`]).
-    precise: Arc<Mutex<Vec<(u64, u64)>>>,
+    recorded: Arc<RecordedMap>,
+}
+
+pub(crate) struct RecordedMap {
+    heap: usize,
+    shared: Arc<Mutex<Shared>>,
+    _bitmap: Bitmap,
+    data: usize,
+    /// Sorted, merged ranges that go back byte for byte instead (root UAVs).
+    precise: Mutex<Vec<(usize, usize)>>,
+}
+
+const DIRTY_WORDS: usize = (CAPACITY + 1) * BLOCK / 32;
+const BITMAP_STRIDE: usize = (DIRTY_WORDS * size_of::<u32>()).next_multiple_of(256);
+const TABLE_BYTES: u64 = (LEVEL1 + (CAPACITY + 1) * BLOCK * 2) as u64 * 4;
+const BITMAP_SLAB_SLOTS: u8 = 8;
+static BITMAP_SLABS: Mutex<Vec<Weak<BitmapSlab>>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+static BITMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static BITMAP_BACKING_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static TABLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn tracking_usage() -> (u64, u64, u64) {
+    (
+        BITMAP_COUNT.load(Ordering::Relaxed),
+        BITMAP_BACKING_BYTES.load(Ordering::Relaxed),
+        TABLE_COUNT.load(Ordering::Relaxed) * TABLE_BYTES,
+    )
+}
+
+/// A CPU-visible UAV split into disjoint, aligned root UAV ranges. Only
+/// recordings keep it alive, so completely idle slabs return their memory.
+struct BitmapSlab {
+    _buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    slots: u8,
+    occupied: Mutex<u8>,
+}
+
+impl BitmapSlab {
+    fn new(slots: u8) -> Option<Arc<Self>> {
+        let bytes = (BITMAP_STRIDE * usize::from(slots)) as u64;
+        let (buffer, data) = crate::host::host()?.shared_buffer(bytes)?;
+        crate::host::name(&buffer, || "title memory written pages".into());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        #[cfg(feature = "diagnostics")]
+        BITMAP_BACKING_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Some(Arc::new(Self { _buffer: buffer, data: data as usize, gpu, slots, occupied: Mutex::new(0) }))
+    }
+
+    fn take(self: &Arc<Self>) -> Option<Bitmap> {
+        let mut occupied = self.occupied.lock().unwrap_or_else(|e| e.into_inner());
+        let index = occupied.trailing_ones() as u8;
+        if index >= self.slots {
+            return None;
+        }
+        *occupied |= 1 << index;
+        let bitmap = Bitmap { slab: self.clone(), index };
+        // SAFETY: the recorded owner of this range has released it, and
+        // acquisition marked it occupied before touching its bytes.
+        unsafe { std::ptr::write_bytes(bitmap.data(), 0, BITMAP_STRIDE) };
+        #[cfg(feature = "diagnostics")]
+        BITMAP_COUNT.fetch_add(1, Ordering::Relaxed);
+        Some(bitmap)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for BitmapSlab {
+    fn drop(&mut self) {
+        BITMAP_BACKING_BYTES.fetch_sub((BITMAP_STRIDE * usize::from(self.slots)) as u64, Ordering::Relaxed);
+    }
+}
+
+/// A recording owns this range until it can no longer submit or replay it.
+struct Bitmap {
+    slab: Arc<BitmapSlab>,
+    index: u8,
+}
+
+impl Bitmap {
+    fn acquire() -> Option<Self> {
+        let mut slabs = BITMAP_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+        slabs.retain(|slab| slab.strong_count() != 0);
+        if let Some(bitmap) = slabs.iter().rev().filter_map(Weak::upgrade).find_map(|slab| slab.take()) {
+            return Some(bitmap);
+        }
+        // Under pressure a single range may still fit when a slab cannot.
+        let slab = BitmapSlab::new(BITMAP_SLAB_SLOTS).or_else(|| BitmapSlab::new(1))?;
+        slabs.push(Arc::downgrade(&slab));
+        slab.take()
+    }
+
+    fn data(&self) -> *mut u8 {
+        (self.slab.data + BITMAP_STRIDE * usize::from(self.index)) as *mut u8
+    }
+
+    fn gpu(&self) -> u64 {
+        self.slab.gpu + (BITMAP_STRIDE * usize::from(self.index)) as u64
+    }
+}
+
+impl Drop for Bitmap {
+    fn drop(&mut self) {
+        let mut occupied = self.slab.occupied.lock().unwrap_or_else(|e| e.into_inner());
+        *occupied &= !(1 << self.index);
+        #[cfg(feature = "diagnostics")]
+        BITMAP_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Map {
@@ -72,10 +187,16 @@ impl Map {
     /// shortcut: a marked page partly in such a range loses what shaders
     /// wrote in its other part.
     pub(crate) fn precise(&self, address: u64, len: u64) {
-        self.precise
+        let from = address as usize;
+        let to = from.saturating_add(len as usize);
+        if from >= to {
+            return;
+        }
+        let mut ranges = self.recorded
+            .precise
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, len));
+            .unwrap_or_else(|e| e.into_inner());
+        crate::host::add_range(&mut ranges, from, to);
     }
 }
 
@@ -85,16 +206,15 @@ impl Map {
 struct Layout {
     copies: Vec<Arc<Shadow>>,
     blocks: Vec<usize>,
-    owner: Vec<Option<usize>>,
+    owner: Vec<Option<NonZeroU32>>,
 }
 
 /// A view heap's page table, shared by every list using title memory with
 /// the heap bound, and the view pairs of the copies it names.
 struct Shared {
-    /// The host heap it was made for (a heap made later at a released one's
-    /// address is another).
-    host: usize,
-    table: ID3D12Resource,
+    /// Keep the host heap alive and distinguish it from a recycled title handle.
+    heap: ID3D12DescriptorHeap,
+    _table: ID3D12Resource,
     data: usize,
     gpu: u64,
     /// The pair of null views entries without a copy name.
@@ -110,11 +230,43 @@ struct Shared {
 // the lock; D3D12 resources are free-threaded.
 unsafe impl Send for Shared {}
 
-/// Page tables by view heap (the title heap's address, or [`OURS`]).
-static SHARED: Mutex<Vec<(usize, Shared)>> = Mutex::new(Vec::new());
+#[cfg(feature = "diagnostics")]
+impl Drop for Shared {
+    fn drop(&mut self) {
+        TABLE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
-fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
+/// Page tables by view heap (the title heap's address, or [`OURS`]).
+type SharedTables = Vec<(usize, Arc<Mutex<Shared>>)>;
+static SHARED: Mutex<SharedTables> = Mutex::new(Vec::new());
+
+fn shared() -> std::sync::MutexGuard<'static, SharedTables> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A released title heap stops publishing its table. Prepared and
+/// recorded users hold their own reference through their last fence.
+pub(crate) fn forget_heap(key: usize) {
+    shared().retain(|(k, _)| *k != key);
+}
+
+/// Release page-table references to windows that left the loose cache,
+/// including on heaps the next submission doesn't use. The caller has
+/// drained the GPU and holds the submission lock.
+pub(crate) fn forget_loose_copies(evicted: &[Arc<Shadow>]) {
+    let removed: HashSet<_> = evicted.iter().map(Arc::as_ptr).collect();
+    let tables = shared().clone();
+    for (key, table) in tables {
+        with_heap(key, |heap| {
+            let mut table = table.lock().unwrap_or_else(|e| e.into_inner());
+            if table.heap == heap.heap
+                && table.layout.copies.iter().any(|copy| removed.contains(&Arc::as_ptr(copy)))
+            {
+                table.rewrite(heap, crate::shadow::generation());
+            }
+        });
+    }
 }
 
 /// Runs `f` on the host heap behind view heap `key` while it cannot go
@@ -191,30 +343,36 @@ pub(crate) fn log_frame() {
 /// Our view heap for lists that bind none of the title's (dynamic slots
 /// only).
 pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
-    static HEAP: std::sync::OnceLock<Option<crate::descriptor::host::HostHeap>> =
+    shared_heap().map(Arc::as_ref)
+}
+
+pub(crate) fn shared_heap() -> Option<&'static Arc<crate::descriptor::host::HostHeap>> {
+    static HEAP: std::sync::OnceLock<Option<Arc<crate::descriptor::host::HostHeap>>> =
         std::sync::OnceLock::new();
-    HEAP.get_or_init(|| crate::descriptor::host::HostHeap::new(false, 0))
+    HEAP.get_or_init(|| crate::descriptor::host::HostHeap::new(false, 0).map(Arc::new))
         .as_ref()
 }
 
-/// The page table for host copies of title memory `copies` (start,
-/// bytes), copy k's view pair at heap index `pairs[k]`, `null` the null
-/// pair: the table's dwords, the level-1 index of each block, and the copy
-/// each entry names. At most [`CAPACITY`] blocks besides the null one.
-fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
+/// Page ownership and the indices of at most [`CAPACITY`] blocks besides
+/// the null one, for host copies given as (start, length).
+fn page_layout(copies: &[(u64, u64)]) -> (Vec<u32>, Vec<usize>, Vec<Option<NonZeroU32>>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
     let mut level1 = vec![0u32; LEVEL1];
     // Block 0 is the null block (no copy).
     let mut blocks = vec![usize::MAX];
-    let mut owner: Vec<Option<(usize, bool)>> = vec![None; BLOCK];
+    // One four-byte index per page. Zero is unassigned, so no second
+    // owner array is needed when publishing the layout.
+    let mut owner = vec![None; BLOCK];
     let mut full = false;
     for &k in &order {
         let (start, len) = copies[k];
-        if len == 0 || start + len > 1 << 40 {
+        let Some(end) = start.checked_add(len) else { continue };
+        if len == 0 || end > 1 << 40 {
             continue;
         }
-        for page in start >> 16..=(start + len - 1) >> 16 {
+        let Some(id) = u32::try_from(k + 1).ok().and_then(NonZeroU32::new) else { continue };
+        for page in start >> 16..=(end - 1) >> 16 {
             let l1 = (page >> 12) as usize;
             if level1[l1] == 0 {
                 if blocks.len() > CAPACITY {
@@ -228,9 +386,9 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
             let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
             // Larger copies come first: a copy holding the whole page takes
             // it from them; one holding part of it only takes it if free.
-            let whole = page << 16 >= start && (page + 1) << 16 <= start + len;
+            let whole = page << 16 >= start && (page + 1) << 16 <= end;
             if whole || owner[entry].is_none() {
-                owner[entry] = Some((k, whole));
+                owner[entry] = Some(id);
             }
         }
     }
@@ -238,31 +396,57 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
     }
-    let mut dwords = level1;
-    for o in &owner {
-        let entry = match *o {
-            Some((k, _)) => [pairs[k], copies[k].0 as u32],
+    (level1, blocks, owner)
+}
+
+fn write_table(
+    dwords: &mut [u32],
+    level1: &[u32],
+    owner: &[Option<NonZeroU32>],
+    copies: &[(u64, u64)],
+    pairs: &[u32],
+    null: u32,
+) {
+    dwords[..LEVEL1].copy_from_slice(level1);
+    for (entry, id) in dwords[LEVEL1..].chunks_exact_mut(2).zip(owner) {
+        let words = match id {
+            Some(id) => {
+                let k = id.get() as usize - 1;
+                [pairs[k], copies[k].0 as u32]
+            }
             None => [null, 0],
         };
-        dwords.extend(entry);
+        entry.copy_from_slice(&words);
     }
-    (dwords, blocks, owner.into_iter().map(|o| o.map(|o| o.0)).collect())
+}
+
+/// Count only copies that won at least one page. If pairs are scarce,
+/// allocate new ones in order of how many pages they make reachable.
+fn page_owners(owner: &[Option<NonZeroU32>], copies: usize) -> Vec<usize> {
+    let mut counts = vec![0; copies];
+    for id in owner.iter().flatten() {
+        counts[id.get() as usize - 1] += 1;
+    }
+    let mut named: Vec<_> = (0..copies).filter(|&k| counts[k] != 0).collect();
+    named.sort_by_key(|&k| std::cmp::Reverse(counts[k]));
+    named
 }
 
 impl Shared {
     /// A page table for `heap`, named nothing yet (written at the first
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
-        let bytes = (LEVEL1 + (CAPACITY + 1) * BLOCK * 2) as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
+        let (table, data) = crate::host::host()?.upload_buffer(TABLE_BYTES)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
+        #[cfg(feature = "diagnostics")]
+        TABLE_COUNT.fetch_add(1, Ordering::Relaxed);
         Some(Shared {
-            host: std::ptr::from_ref(heap) as usize,
-            table,
+            heap: heap.heap.clone(),
+            _table: table,
             data: data as usize,
             gpu,
             null,
@@ -272,13 +456,15 @@ impl Shared {
         })
     }
 
-    /// Names every host copy there is now (`now`: their generation): view
-    /// pairs made for new copies, those of copies gone made null and given
-    /// back, the table rewritten. Only while no submission runs (the GPU
-    /// reads the table and the views).
+    /// Selects page owners before allocating pairs. A copy that owns no
+    /// page needs neither a descriptor nor a refresh through this table.
+    /// Only while no submission runs (the GPU reads the table and views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
         let copies = crate::shadow::all();
-        let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
+        let ranges: Vec<_> = copies.iter().map(|copy| copy.range()).collect();
+        let (mut level1, mut blocks, mut owner) = page_layout(&ranges);
+        let reachable = page_owners(&owner, copies.len());
+        let live: HashSet<_> = reachable.iter().map(|&k| Arc::as_ptr(&copies[k]) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
             let keep = live.contains(copy);
             if !keep {
@@ -287,15 +473,20 @@ impl Shared {
             }
             keep
         });
-        let (mut named, mut slots) = (Vec::with_capacity(copies.len()), Vec::with_capacity(copies.len()));
-        for c in copies {
-            let key = Arc::as_ptr(&c) as usize;
+        let (mut named, mut slots) = (Vec::with_capacity(reachable.len()), Vec::with_capacity(reachable.len()));
+        let mut published = vec![None; copies.len()];
+        let mut exhausted = false;
+        for k in reachable {
+            let c = &copies[k];
+            let key = Arc::as_ptr(c) as usize;
             let slot = match self.pairs.get(&key) {
                 Some(&slot) => slot,
+                None if exhausted => continue,
                 None => {
                     let Some(slot) = heap.pair() else {
                         static ONCE: std::sync::Once = std::sync::Once::new();
                         ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
+                        exhausted = true;
                         continue;
                     };
                     heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
@@ -303,14 +494,27 @@ impl Shared {
                     slot
                 }
             };
-            named.push(c);
+            named.push(c.clone());
             slots.push(slot);
+            published[k] = NonZeroU32::new(named.len() as u32);
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
-        let (dwords, blocks, owner) = table(&ranges, &slots, self.null);
-        // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
-        // keeps to; no submission runs.
-        unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
+        if exhausted {
+            // If the preferred owner got no pair, a published overlapping
+            // copy may still cover its pages.
+            (level1, blocks, owner) = page_layout(&ranges);
+        } else {
+            for id in &mut owner {
+                *id = id.and_then(|id| published[id.get() as usize - 1]);
+            }
+        }
+        // SAFETY: the mapping has room for `CAPACITY` blocks, which `page_layout`
+        // keeps to; no submission runs. Write the GPU table in place to
+        // avoid a second, potentially 16 MiB, allocation during a rewrite.
+        let data = unsafe {
+            std::slice::from_raw_parts_mut(self.data as *mut u32, LEVEL1 + 2 * owner.len())
+        };
+        write_table(data, &level1, &owner, &ranges, &slots, self.null);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
             copies: named,
@@ -322,88 +526,83 @@ impl Shared {
     }
 }
 
-/// The page table of view heap `key`, as the last submission using it
-/// left it.
-fn layout(key: usize) -> Arc<Layout> {
-    shared()
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, s)| s.layout.clone())
-        .unwrap_or_default()
+/// The exact layout of the table used by the submitted lists. While this
+/// lease exists, the host drains before rewriting a table or reusing a
+/// recorded bitmap. A recorded map can be replayed after its fence.
+pub(crate) struct PreparedTable {
+    layout: Arc<Layout>,
+    maps: Vec<Arc<RecordedMap>>,
 }
 
-/// At submission, for a list using title memory with view heap `key`
-/// bound: the heap's page table names every host copy there is, each
-/// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let layout = with_heap(key, |heap| {
-        let mut shared = shared();
-        let host = std::ptr::from_ref(heap) as usize;
-        let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
-        let now = crate::shadow::generation();
-        if s.generation != now {
-            s.rewrite(heap, now);
+impl PreparedTable {
+    pub(crate) fn keep(&mut self, map: &Arc<RecordedMap>) {
+        if !self.maps.iter().any(|current| Arc::ptr_eq(current, map)) {
+            self.maps.push(map.clone());
         }
-        Some(s.layout.clone())
-    })
-    .flatten();
-    for c in layout.iter().flat_map(|l| &l.copies) {
-        let (start, len) = c.range();
-        add(c, start as usize, len as usize);
+    }
+
+    pub(crate) fn refresh(&self, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+        for copy in &self.layout.copies {
+            let (start, len) = copy.range();
+            add(copy, start as usize, len as usize);
+        }
     }
 }
 
-/// `list` uses title memory with view heap `key` bound: the heap's page
-/// table (made on first use) and a page bitmap of the list's, the table
-/// brought up to date at each submission of the list, its written pages
-/// copied back after.
-pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
-    let table = with_heap(key, |heap| {
-        let mut shared = shared();
-        let host = std::ptr::from_ref(heap) as usize;
-        if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
-            list.keep(&s.table);
-            return Some(s.gpu);
+impl RecordedMap {
+    pub(crate) fn key(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
+    }
+
+    pub(crate) fn prepare(&self) -> PreparedTable {
+        with_heap(self.heap, |heap| {
+            let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if shared.heap == heap.heap {
+                let now = crate::shadow::generation();
+                if shared.generation != now {
+                    shared.rewrite(heap, now);
+                }
+            }
+        });
+        PreparedTable {
+            layout: self
+                .shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .layout
+                .clone(),
+            maps: Vec::new(),
         }
-        // A released heap's table goes with it (lists that name it hold it).
-        shared.retain(|(k, _)| *k != key);
-        let s = Shared::new(heap)?;
-        list.keep(&s.table);
-        let gpu = s.gpu;
-        shared.push((key, s));
-        Some(gpu)
-    })
-    .flatten()?;
-    let bits = (CAPACITY + 1) * BLOCK;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
-    crate::host::name(&bitmap, || "title memory written pages".into());
-    let words = bits / 32;
-    // SAFETY: our mapped buffer of at least `words` dwords.
-    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
-    // SAFETY: a live buffer.
-    let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
-    list.keep(&bitmap);
-    list.defer_memory(key);
-    let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
-    let byte_for_byte = precise.clone();
-    let data = data as usize;
-    list.defer_missed(move || {
-        let l = layout(key);
-        // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
-        marks.iter().enumerate().any(|(w, &mark)| {
-            (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
-                let entry = w * 32 + b;
-                entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none())
-            })
+    }
+
+    pub(crate) fn missed(&self, table: &PreparedTable) -> bool {
+        let layout = &table.layout;
+        // SAFETY: the list's fence passed and this submission owns CPU
+        // access to its recorded bitmap until retirement completes.
+        let marks = unsafe { std::slice::from_raw_parts(self.data as *const u32, DIRTY_WORDS) };
+        marks.iter().enumerate().any(|(word, &mark)| {
+            let mut bits = mark;
+            while bits != 0 {
+                let entry = word * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if entry / BLOCK == 0 || layout.owner.get(entry).is_none_or(|o| o.is_none()) {
+                    return true;
+                }
+            }
+            false
         })
-    });
-    list.defer_after(move || {
-        let Layout { copies, blocks, owner } = &*layout(key);
-        let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+    }
+
+    pub(crate) fn copy_back(&self, table: &PreparedTable, list_missed: bool) {
+        let Layout {
+            copies,
+            blocks,
+            owner,
+        } = &*table.layout;
+        let precise = self.precise.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the list's fence passed and the mapped bitmap is leased
+        // to this submission until retirement completes.
+        let marks = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, DIRTY_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
@@ -418,13 +617,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     missed.push((entry as u64) << 28);
                     continue;
                 };
-                let at = (l1 << 28 | page << 16) as u64;
+                let at = l1 << 28 | page << 16;
                 match owner.get(entry) {
-                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
-                    Some(Some(k)) => writes.push((*k, at)),
+                    Some(Some(id)) => {
+                        let first = precise.partition_point(|&(_, end)| end <= at);
+                        if !precise.get(first).is_some_and(|&(start, _)| start < at + crate::watch::PAGE) {
+                            writes.push((id.get() as usize - 1, at));
+                        }
+                    }
                     _ => {
                         pages += 1;
-                        missed.push(at);
+                        missed.push(at as u64);
                     }
                 }
             }
@@ -432,12 +635,18 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // What shaders computed from memory with no copy (read as zeros) is
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1).
-        // shortcut: root UAV writes of such a list still go back (their
-        // bytes, `Shadow::gpu_writes`).
-        let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
+        // Declared UAV writes are handled separately by submission retirement.
+        // A list can switch heaps and use several bitmaps. Its later dispatches
+        // can read results from earlier ones, even through a different map.
+        let withheld = if list_missed || pages + regions > 0 { writes.len() as u64 } else { 0 };
         let mut written = 0;
-        for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+        for (k, at) in writes {
+            if withheld != 0 {
+                // A later clean list must reload this page from title memory.
+                copies[k].invalidate(at, crate::watch::PAGE);
+                continue;
+            }
+            let n = copies[k].copy_back_page(at);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),
@@ -454,17 +663,105 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
         });
+    }
+}
+
+/// Bind title memory to a recorded list. The GPU addresses must remain
+/// stable while the list can be replayed. Each execution leases this map
+/// and captures its page table layout before submitting.
+pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
+    let shared = with_heap(key, |heap| {
+        let mut tables = shared();
+        if let Some((_, table)) = tables.iter().find(|(k, table)| {
+            *k == key && table.lock().unwrap_or_else(|e| e.into_inner()).heap == heap.heap
+        }) {
+            return Some(table.clone());
+        }
+        let table = Arc::new(Mutex::new(Shared::new(heap)?));
+        tables.retain(|(k, _)| *k != key);
+        tables.push((key, table.clone()));
+        Some(table)
+    })
+    .flatten()?;
+    let table = shared.lock().unwrap_or_else(|e| e.into_inner()).gpu;
+    let bitmap = Bitmap::acquire()?;
+    let dirty = bitmap.gpu();
+    let data = bitmap.data();
+    let recorded = Arc::new(RecordedMap {
+        heap: key,
+        shared,
+        _bitmap: bitmap,
+        data: data as usize,
+        precise: Mutex::default(),
     });
+    list.defer_memory(recorded.clone());
     Some(Map {
         table,
         dirty,
-        precise,
+        recorded,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_ranges_are_disjoint_and_reused_only_after_release() {
+        let Some(host) = crate::host::host() else { return };
+        let slab = BitmapSlab::new(2).unwrap();
+        let first = slab.take().unwrap();
+        let second = slab.take().unwrap();
+        assert_eq!(second.gpu() - first.gpu(), BITMAP_STRIDE as u64);
+        assert_eq!(first.gpu() % 256, 0);
+        assert!(slab.take().is_none());
+        let first_gpu = first.gpu();
+        let (root, pso) = pipeline(r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants=1, b0)"
+RWByteAddressBuffer dst : register(u0);
+cbuffer constants : register(b0) { uint value; }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { dst.Store(0, value); }
+"#);
+        let list = host.new_list().unwrap();
+        // SAFETY: an open command list and two live, disjoint UAV ranges.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            for (bitmap, value) in [(&first, 1), (&second, 2)] {
+                list.list.SetComputeRootUnorderedAccessView(0, bitmap.gpu());
+                list.list.SetComputeRoot32BitConstant(1, value, 0);
+                list.list.Dispatch(1, 1, 1);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: execute waits for the GPU; these words are in the mapping.
+        assert_eq!(unsafe { first.data().cast::<u32>().read() }, 1);
+        assert_eq!(unsafe { second.data().cast::<u32>().read() }, 2);
+        drop(first);
+        let reused = slab.take().unwrap();
+        assert_eq!(reused.gpu(), first_gpu);
+        // SAFETY: first lease was released and second is still disjoint.
+        unsafe {
+            assert_eq!(reused.data().read(), 0);
+            assert_eq!(second.data().read(), 2);
+        }
+        let owner = Arc::downgrade(&slab);
+        drop(slab);
+        drop(second);
+        assert!(owner.upgrade().is_some());
+        drop(reused);
+        assert!(owner.upgrade().is_none());
+    }
+
+    fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<NonZeroU32>>) {
+        let (level1, blocks, owner) = page_layout(copies);
+        let mut dwords = vec![0; LEVEL1 + 2 * owner.len()];
+        write_table(&mut dwords, &level1, &owner, copies, pairs, null);
+        (dwords, blocks, owner)
+    }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's
     /// dwords: the view index and the byte offset in that view.
@@ -501,9 +798,64 @@ mod tests {
         // Entries map back to their copy and page.
         let entry = |a: u64| blocks.iter().position(|&l| l == (a >> 28) as usize).unwrap() * BLOCK
             + (a >> 16 & 0xFFF) as usize;
-        assert_eq!(owner[entry(0x42_0000)], Some(1));
-        assert_eq!(owner[entry(0xd_1234_0000)], Some(2));
+        assert_eq!(owner[entry(0x42_0000)].map(NonZeroU32::get), Some(2));
+        assert_eq!(owner[entry(0xd_1234_0000)].map(NonZeroU32::get), Some(3));
         assert_eq!(blocks.len(), 3, "null, low 256 MiB, the high buffer's");
+    }
+
+    #[test]
+    fn a_missing_page_overlapping_a_precise_range_still_blocks_copy_back() {
+        let Some(host) = crate::host::host() else { return };
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).unwrap();
+        let page_size = crate::watch::PAGE;
+        let at = crate::watch::tests::pool(1);
+        crate::shadow::register(at, at as u64, page_size as u64);
+        let copy = crate::shadow::find(at as u64, 4).unwrap();
+        copy.update(at, page_size, None);
+        copy.write_host(at as u64, &[7]);
+        let page = (at >> 16) & (BLOCK - 1);
+        let missing = page ^ 1;
+        let region = at >> 28;
+        map.precise(((region << 28) | (missing << 16)) as u64, 4);
+        let mut owner = vec![None; 2 * BLOCK];
+        owner[BLOCK + page] = NonZeroU32::new(1);
+        let table = PreparedTable {
+            layout: Arc::new(Layout {
+                copies: vec![copy.clone()],
+                blocks: vec![usize::MAX, region],
+                owner,
+            }),
+            maps: Vec::new(),
+        };
+        let mark = |page| {
+            let bit: usize = BLOCK + page;
+            // SAFETY: no GPU uses this test map. Both bits are in its allocation.
+            unsafe { *((map.recorded.data as *mut u32).add(bit / 32)) |= 1 << (bit % 32) };
+        };
+        let first_byte = || {
+            // SAFETY: the test owns this live allocation until the end of the test.
+            unsafe { (at as *const u8).read() }
+        };
+        mark(page);
+        mark(missing);
+        assert!(map.recorded.missed(&table));
+        map.recorded.copy_back(&table, false);
+        assert_eq!(first_byte(), 0);
+        assert!(!map.recorded.missed(&table), "retirement clears the bitmap");
+        mark(page);
+        map.recorded.copy_back(&table, true);
+        assert_eq!(first_byte(), 0, "a miss in another heap's bitmap blocks copy-back");
+        assert!(!map.recorded.missed(&table), "the clean bitmap is also cleared");
+        assert_eq!(copy.update(at, page_size, None), page_size);
+        assert_eq!(copy.read_host(at as u64, 1), [0], "the rejected output was discarded");
+        copy.write_host(at as u64, &[7]);
+        mark(page);
+        map.recorded.copy_back(&table, false);
+        assert_eq!(first_byte(), 7);
+        crate::shadow::unregister(at, at as u64);
+        drop(table);
+        crate::watch::tests::free(at);
     }
 
     /// Copies in more regions than a table has room for: the largest are
@@ -541,7 +893,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline() -> (
+    fn pipeline(source: &str) -> (
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
@@ -554,8 +906,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: the source and names outlive the call; the errors are text.
         unsafe {
             let made = D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 s!("memory"),
                 None,
                 None,
@@ -594,6 +946,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             .iter()
             .find(|(k, _)| *k == key)?
             .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .pairs
             .get(&(Arc::as_ptr(copy) as usize))
             .copied()
@@ -609,7 +963,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        let (root, pso) = pipeline();
+        let (root, pso) = pipeline(SOURCE);
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };
@@ -630,6 +984,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::shadow::find(p as u64, (pages * PAGE) as u64).unwrap()
         };
         let (a, b) = (copy(memory[0], 1), copy(memory[1], 2));
+        // A suballocation whose entire range shares a page with a full
+        // owner has a direct host copy but cannot be named by the table.
+        let partial_at = memory[1] + 64;
+        crate::shadow::register(partial_at, partial_at as u64, 32);
+        let partial = crate::shadow::find(partial_at as u64, 32).unwrap();
         let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
         // Each list reads 4 dwords at its address into its 16 bytes of `out`.
         let record = |reads: [usize; 2]| -> Vec<Map> {
@@ -670,7 +1029,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        assert!(pair_of(OURS, &partial).is_none(), "unreachable copies take no pair");
+        let heap = heap().unwrap();
+        assert_ne!(pairs.0, pairs.1);
+        assert!(
+            heap.pair_is_reserved(pairs.0) && heap.pair_is_reserved(pairs.1),
+            "copy views hold their slots"
+        );
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
@@ -682,10 +1047,67 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]);
         assert_eq!((pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()), pairs, "views kept");
+        assert!(heap.pair_is_reserved(pairs.0) && heap.pair_is_reserved(pairs.1));
         assert!(pair_of(OURS, &c).is_some());
+        crate::shadow::unregister(partial_at, partial_at as u64);
         for (&p, copy) in memory.iter().zip([a, b, c]) {
             crate::shadow::unregister(p, p as u64);
             drop(copy);
         }
+    }
+
+    #[test]
+    fn an_unmapped_loose_copy_is_released_and_its_page_table_restores_it_on_remap() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        let (Some(host), Some(_)) = (crate::host::host(), heap()) else { return };
+        let bytes = 4 << 20;
+        // SAFETY: reserve a loose window at a fresh, aligned address below 1 TiB.
+        let address = (0..32)
+            .map(|i| 0x30_0000_0000usize + i * bytes)
+            .map(|at| unsafe { VirtualAlloc(at as *const _, bytes, MEM_RESERVE, PAGE_NOACCESS) })
+            .find(|p| !p.is_null())
+            .unwrap();
+        // SAFETY: commit the first page of this test's reservation.
+        assert_eq!(unsafe { VirtualAlloc(address, PAGE, MEM_COMMIT, PAGE_READWRITE) }, address);
+        let copy = crate::shadow::find(address as u64, 4).unwrap();
+        let weak = Arc::downgrade(&copy);
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        assert!(pair_of(OURS, &copy).is_some());
+        drop(copy);
+
+        // SAFETY: decommit the only committed page of our reservation.
+        assert_eq!(unsafe { VirtualFree(address, PAGE, MEM_DECOMMIT) }, 1);
+        crate::watch::title_memory_remapped(address as usize, PAGE);
+        // This submission doesn't bind the table. Reclamation must still
+        // release the stale table's reference.
+        let idle = host.new_list().unwrap();
+        idle.close();
+        host.execute(&[&idle]);
+        assert!(weak.upgrade().is_none());
+
+        // SAFETY: recommit the test page, then populate it before the GPU reads it.
+        assert_eq!(unsafe { VirtualAlloc(address, PAGE, MEM_COMMIT, PAGE_READWRITE) }, address);
+        crate::watch::title_memory_remapped(address as usize, PAGE);
+        unsafe { address.cast::<u32>().write(0x1234_5678) };
+        host.execute(&[&list]);
+        let restored = crate::shadow::all()
+            .into_iter()
+            .find(|copy| copy.range().0 == address as u64)
+            .expect("submission restored the window before any direct lookup");
+        assert!(pair_of(OURS, &restored).is_some());
+        assert_eq!(restored.read_host(address as u64, 1), [0x1234_5678]);
+        drop(restored);
+        drop(map);
+        // SAFETY: the last submission retired. Release this test's reservation.
+        assert_eq!(unsafe { VirtualFree(address, 0, MEM_RELEASE) }, 1);
+        crate::watch::title_memory_remapped(address as usize, bytes);
+        host.execute(&[&idle]);
     }
 }

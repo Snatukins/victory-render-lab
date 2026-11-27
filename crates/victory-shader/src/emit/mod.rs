@@ -82,21 +82,13 @@
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
-//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
-//!   many slots, those past its own null, so an index past the heap (data
-//!   still wrong; the console would read whatever memory follows its heap)
-//!   reads nothing instead of faulting the device.
-//! * **Buffer views at computed heap indices** (added 2026-11-24): a
-//!   buffer read through a descriptor the shader takes from the resource
-//!   heap itself first looks up the view-stride table (root SRV
-//!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
-//!   unordered access the index below), which the host keeps a null raw
-//!   buffer SRV (UAV). The index comes from data, and a texture descriptor
-//!   read as a buffer one is a wild address (the texture's shifted 8 bits
-//!   down: GPU faults at low addresses).
+//! * **Heap indices** are checked against the bound heaps' ordinary slot
+//!   limits. Out-of-range indices select a reserved descriptor matching the
+//!   resource class and dimension. The limits also locate the reserved tails.
+//! * **Buffer views at computed heap indices** consult the view-stride
+//!   table. Out-of-range slots and slots with zero stride use the same
+//!   null descriptor path, so a texture is never interpreted as a buffer
+//!   on the basis of a zero-stride entry.
 //! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
 //!   added 2026-11-24): whether the shader takes descriptors from the
 //!   resource heap itself, and unordered access views among them; the
@@ -219,8 +211,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_BOUND_WORDS, HEAP_BOUNDS, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_SAMPLERS,
+    NULL_VIEWS, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS,
+    VIEW_STRIDE_STRUCTURED_SRV, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, null_view_properties,
 };
 
 /// The loop limit without an override: 2^20.
@@ -357,6 +350,14 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Permit a 32-lane hardware wave for a logical wave64 compute group
+    /// when all its threads fit into one hardware wave.
+    pub wave32_only: bool,
+    /// Lower one logical wave64 as a 64-thread group. The caller must have
+    /// verified that all shader LDS accesses are private to their lane.
+    pub wave64_group_collectives: bool,
+    /// Broadcast the first active compute lane via a bitwise reduction.
+    pub compute_wave_first_reduce: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -482,14 +483,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with(&parts(st, res), options) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with(&parts(&st, &res), options)?
         }
         l => l?,
     };
@@ -618,6 +619,195 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    #[cfg(windows)]
+    fn wave_first_reduction_preserves_divergent_lane_values() {
+        use super::bitcode::{Bin, Term, pred};
+        use super::host::{Dispatch, Host, Root};
+        let _lock = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(true) else { return };
+        let make = |reduce| {
+            let mut s = super::shader::Shader::new(false);
+            s.threads = Some([32, 1, 1]);
+            let entry = s.entry;
+            let active = s.m.new_block();
+            let done = s.m.new_block();
+            let lane = s.op(entry, "flattenedThreadIdInGroup.i32", Attr::ReadNone, s.t.i32, 96, &[]);
+            let five = s.m.i32(5);
+            let high_bits = s.m.i32(0xfc00_7c00);
+            let value = s.m.bin(entry, Bin::Or, lane, high_bits);
+            let takes_branch = s.m.cmp(entry, pred::IUGE, lane, five);
+            s.m.terminate(entry, Term::CondBr(takes_branch, active, done));
+            let first = s.wave_first(active, value, reduce);
+            s.m.terminate(active, Term::Br(done));
+            let result = s.m.phi(done, s.t.i32);
+            let zero = s.m.i32(0);
+            s.m.set_phi(result, vec![(zero, entry), (first, active)]);
+            let uav = s.root_uav_handle(0);
+            let four = s.m.i32(4);
+            let offset = s.m.bin(done, Bin::Mul, lane, four);
+            let unused = s.m.undef(s.t.i32);
+            let mask = s.m.i8(1);
+            s.op(done, "rawBufferStore.i32", Attr::NoUnwind, s.t.void, 140,
+                &[uav, offset, unused, result, unused, unused, unused, mask, four]);
+            s.m.terminate(done, Term::Ret);
+            super::HostShader {
+                stage: crate::HwStage::Cs,
+                dxil: s.finish(),
+                root_uavs: vec![0],
+                ..super::host::stub_ps()
+            }
+        };
+        let run = |host: &Host, reduce| {
+            let mut shader = make(reduce);
+            if let Ok(mut validator) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                validator.validate(&mut shader.dxil).unwrap();
+            }
+            let (root, pipeline) = host.compute_pipeline(&shader)
+                .unwrap_or_else(|error| panic!("wave-first reduce={reduce}: {error}"));
+            host.dispatch(&root, &pipeline, &Dispatch {
+                roots: vec![(1, Root::Uav(32))],
+                views: &[], samplers: &[], groups: [1, 1, 1],
+            }).unwrap()
+        };
+        let reference = run(&host, false);
+        assert_eq!(&reference[0][..5], &[0; 5]);
+        assert_eq!(reference[0][5], 0xfc00_7c05);
+        assert_eq!(run(&host, true), reference);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn group_sums_span_both_halves_and_reuse_scratch() {
+        use super::bitcode::{Bin, Term, pred};
+        use super::host::{Dispatch, Host, Root};
+        let _lock = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            return;
+        };
+        let mut s = super::shader::Shader::new(false);
+        s.threads = Some([64, 1, 1]);
+        let at = s.entry;
+        let lane = s.op(at, "flattenedThreadIdInGroup.i32", Attr::ReadNone, s.t.i32, 96, &[]);
+        let zero = s.m.i32(0);
+        let group = s.op(at, "groupId.i32", Attr::ReadNone, s.t.i32, 94, &[zero]);
+        let threads = s.m.i32(64);
+        let group_start = s.m.bin(at, Bin::Mul, group, threads);
+        let index = s.m.bin(at, Bin::Add, group_start, lane);
+        let three = s.m.i32(3);
+        let low = s.m.bin(at, Bin::And, lane, three);
+        let masked = s.m.cmp(at, pred::EQ, low, zero);
+        let value = s.m.bin(at, Bin::Sub, zero, index);
+        let value = s.m.select(at, masked, zero, value);
+        let all = s.group_sum64(at, lane, value, None);
+        let exclusive = s.group_sum64(at, lane, value, Some(false));
+        let inclusive = s.group_sum64(at, lane, value, Some(true));
+
+        let uav = s.root_uav_handle(0);
+        let stride = s.m.i32(12);
+        let offset = s.m.bin(at, Bin::Mul, index, stride);
+        let offset_unused = s.m.undef(s.t.i32);
+        let mask = s.m.i8(7);
+        let alignment = s.m.i32(4);
+        s.op(at, "rawBufferStore.i32", Attr::NoUnwind, s.t.void, 140,
+            &[uav, offset, offset_unused, all, exclusive, inclusive, offset_unused, mask, alignment]);
+        s.m.terminate(at, Term::Ret);
+        let shader = super::HostShader {
+            stage: crate::HwStage::Cs,
+            dxil: s.finish(),
+            root_uavs: vec![0],
+            ..super::host::stub_ps()
+        };
+        let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+        let outputs = host.dispatch(&root, &pipeline, &Dispatch {
+            roots: vec![(1, Root::Uav(3 * 64 * 3))],
+            views: &[],
+            samplers: &[],
+            groups: [3, 1, 1],
+        }).unwrap();
+        let mut expected = Vec::new();
+        for group in 0..3u32 {
+            let values = (0..64u32).map(|lane| {
+                if lane % 4 == 0 { 0 } else { 0u32.wrapping_sub(group * 64 + lane) }
+            });
+            let total = values.clone().fold(0, u32::wrapping_add);
+            let mut prefix = 0u32;
+            for value in values {
+                expected.extend([total, prefix, prefix.wrapping_add(value)]);
+                prefix = prefix.wrapping_add(value);
+            }
+        }
+        assert_eq!(outputs, [expected]);
+    }
+
+    #[test]
+    fn wave32_host_accepts_a_wave64_group_that_fits() {
+        use crate::native::{ComputeIo, StageIo};
+        use crate::{Container, FourCC, HwStage, NativeProgram, io, ir, resource, structure};
+
+        let make = |threads, wave32_only| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                // LDS makes the physical wave width matter even for a
+                // program that does not use cross-lane intrinsics.
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15,
+                    threads: [threads, 1, 1],
+                }),
+                code: 0xBF81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+            };
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let empty = crate::dxbc::build(&[]);
+            let c = Container::parse(&empty).unwrap();
+            super::emit_with(
+                &c, &native, &p, &st, &io, &res,
+                super::Options { wave32_only, ..Default::default() },
+            ).unwrap()
+        };
+        let wave = |shader: &super::HostShader| {
+            let c = Container::parse(&shader.dxil).unwrap();
+            let psv = c.part(FourCC::PSV0).unwrap().data;
+            (crate::dxbc::u32_at(psv, 20).unwrap(), crate::dxbc::u32_at(psv, 24).unwrap())
+        };
+        let original = make(32, false);
+        let fallback = make(32, true);
+        assert_eq!(wave(&original), (64, 64));
+        assert_eq!(wave(&fallback), (32, 32));
+        assert_eq!(wave(&make(33, true)), (64, 64));
+        assert_eq!(wave(&make(64, true)), (64, 64));
+
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            use windows::Win32::Graphics::Direct3D12::*;
+            let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the output points to a structure of the queried type.
+            let result = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut caps).cast(),
+                    size_of_val(&caps) as u32,
+                )
+            };
+            if result.is_ok() && caps.WaveOps.as_bool()
+                && caps.WaveLaneCountMin <= 32 && caps.WaveLaneCountMax >= 32
+            {
+                host.compute_pipeline(&fallback).unwrap();
+                if caps.WaveLaneCountMax < 64 {
+                    assert!(host.compute_pipeline(&original).is_err());
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

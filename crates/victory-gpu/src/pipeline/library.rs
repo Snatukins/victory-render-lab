@@ -30,6 +30,8 @@
 //! must still be right when the bytes are written.
 
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -53,7 +55,7 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    blob: PipelineBlob,
     /// Pipelines stored since the last save.
     added: u64,
     /// Title pipelines the pre-build put in the library or found there, by
@@ -65,6 +67,91 @@ struct Library {
 // SAFETY: D3D12 objects are free-threaded (a pipeline library with the
 // exception `NAMES` takes care of).
 unsafe impl Send for Library {}
+
+struct SharedLibrary {
+    /// Cached loads can start even while a save holds the state lock.
+    loads: ID3D12PipelineLibrary1,
+    state: Mutex<Library>,
+}
+
+#[derive(Default)]
+enum PipelineBlob {
+    #[default]
+    Empty,
+    Mapped(MappedBlob),
+    #[cfg(test)]
+    Bytes(Vec<u8>),
+}
+
+impl PipelineBlob {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Empty => &[],
+            Self::Mapped(map) => {
+                // SAFETY: this read-only mapping stays live through the
+                // borrow and the open file denies writes to its contents.
+                unsafe { std::slice::from_raw_parts(map.view.Value.cast(), map.len) }
+            }
+            #[cfg(test)]
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+}
+
+/// The cache can be read from disk again if Windows reclaims these pages.
+/// Keep the file open to deny in-place writes, while allowing a rename to
+/// publish the next cache without changing the bytes the driver reads.
+struct MappedBlob {
+    view: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+    _file: File,
+}
+
+impl MappedBlob {
+    fn open(path: &std::path::Path) -> std::io::Result<PipelineBlob> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)?;
+        let len = usize::try_from(file.metadata()?.len())
+            .ok()
+            .filter(|&len| len <= isize::MAX as usize)
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        if len == 0 {
+            return Ok(PipelineBlob::Empty);
+        }
+        // SAFETY: a readable file, with a mapping of its full length.
+        let mapping = unsafe {
+            CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+        };
+        if mapping.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the view keeps the mapping alive after its handle closes.
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, len) };
+        let result = if view.Value.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(PipelineBlob::Mapped(Self { view, len, _file: file }))
+        };
+        unsafe { CloseHandle(mapping) };
+        result
+    }
+}
+
+impl Drop for MappedBlob {
+    fn drop(&mut self) {
+        // SAFETY: this owns the mapped view and the driver's library has
+        // already dropped (fields of Library drop in declaration order).
+        unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.view) };
+    }
+}
 
 /// Names one thread at a time holds.
 struct Names {
@@ -117,47 +204,58 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
-fn library() -> Option<&'static Mutex<Library>> {
-    static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
+fn library() -> Option<&'static SharedLibrary> {
+    static LIBRARY: OnceLock<Option<SharedLibrary>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
+            let blob = DIR.get().map_or(PipelineBlob::Empty, |dir| {
+                match MappedBlob::open(&dir.join(LIBRARY_FILE)) {
+                    Ok(blob) => blob,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => PipelineBlob::Empty,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not map the host pipeline library");
+                        PipelineBlob::Empty
+                    }
+                }
+            });
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
             if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
-                && !l._blob.is_empty()
+                && !l.blob.bytes().is_empty()
             {
-                l.prebuilt = listed(&list, &tag);
+                l.prebuilt = listed(&list, &tag(l.blob.bytes()));
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
-            library.map(Mutex::new)
+            library.map(|library| SharedLibrary {
+                loads: library.library.clone(),
+                state: Mutex::new(library),
+            })
         })
         .as_ref()
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+fn open(device: &ID3D12Device1, blob: PipelineBlob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
-    if !blob.is_empty() {
+    if !blob.bytes().is_empty() {
         let started = std::time::Instant::now();
-        match make(&blob) {
+        match make(blob.bytes()) {
             Ok(library) => {
                 let ms = started.elapsed().as_millis() as u64;
-                tracing::info!(bytes = blob.len(), ms, "host pipeline library loaded");
+                tracing::info!(bytes = blob.bytes().len(), ms, "host pipeline library loaded");
                 return Some(Library {
                     library,
-                    _blob: blob,
+                    blob,
                     added: 0,
                     prebuilt: HashSet::new(),
                     prebuilt_changed: false,
@@ -171,7 +269,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let library = make(&[]).ok()?;
     Some(Library {
         library,
-        _blob: Vec::new(),
+        blob: PipelineBlob::Empty,
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
@@ -187,6 +285,7 @@ fn tag(blob: &[u8]) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
+        b"heap-bounds-v1",
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
@@ -217,13 +316,13 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
 
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
-    library().is_some_and(|l| l.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
+    library().is_some_and(|l| l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
 pub(crate) fn note_prebuilt(key: String) {
     if let Some(l) = library() {
-        let mut l = l.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = l.state.lock().unwrap_or_else(|e| e.into_inner());
         l.prebuilt_changed |= l.prebuilt.insert(key);
     }
 }
@@ -256,23 +355,22 @@ pub(crate) fn pipeline(
         return create();
     };
     let _held = NAMES.hold(name);
-    // The interface alone under the lock: loads take up to seconds. Its
-    // blob lives as long as the library, which is never dropped.
-    let loads = library
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .library
-        .clone();
-    if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
-        LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+    // This free-threaded interface shares the library whose backing blob
+    // stays in the process-wide state for its entire lifetime.
+    match load(&library.loads, PCWSTR(wide.as_ptr())) {
+        Ok(pso) => {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
+        Err(error) if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY => return Err(error),
+        Err(_) => {}
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
-    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+    let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -293,8 +391,10 @@ thread_local! {
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static SAVE: Mutex<()> = Mutex::new(());
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let _save = SAVE.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -302,26 +402,42 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+    let (blob, prebuilt, saved_added, saved_prebuilt_changed) = {
+        let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.load(Ordering::Relaxed) {
             return;
         }
+        // Serializing requires a second, contiguous copy of the entire library.
+        // Avoid that large transient allocation during gameplay; explicit saves
+        // can still persist it when the caller is prepared to wait.
+        let size = unsafe { l.library.GetSerializedSize() };
+        const MAX_PERIODIC_SAVE_BYTES: usize = 128 * 1024 * 1024;
+        if !now && size > MAX_PERIODIC_SAVE_BYTES {
+            tracing::debug!(bytes = size, "large pipeline library save deferred");
+            return;
+        }
+        let mut bytes = Vec::new();
+        if let Err(error) = bytes.try_reserve_exact(size) {
+            tracing::warn!(bytes = size, %error, "pipeline library save skipped: insufficient memory");
+            return;
+        }
+        bytes.resize(size, 0u8);
+        USED_CHANGED.swap(false, Ordering::Relaxed);
         // SAFETY: a buffer of the size the library asks for.
         let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
             l.library.Serialize(&mut bytes).map(|()| bytes)
         };
         match bytes {
             Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
+                let saved_added = std::mem::take(&mut l.added);
+                let saved_prebuilt_changed = std::mem::take(&mut l.prebuilt_changed);
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                (bytes, prebuilt, saved_added, saved_prebuilt_changed)
             }
             Err(e) => {
+                USED_CHANGED.store(true, Ordering::Relaxed);
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 return;
             }
@@ -350,7 +466,13 @@ pub(crate) fn save(now: bool) {
             shaders_translated,
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+            l.added = l.added.saturating_add(saved_added);
+            l.prebuilt_changed |= saved_prebuilt_changed;
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved; will retry");
+        }
     }
 }
 
@@ -498,6 +620,27 @@ mod tests {
     }
 
     #[test]
+    fn cached_load_starts_while_the_save_state_is_locked() {
+        let Some(library) = library() else { return };
+        let state = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (entered, wait) = std::sync::mpsc::channel();
+        let load = std::thread::spawn(move || {
+            pipeline(
+                "test pipeline load during save",
+                |_, _| {
+                    entered.send(()).unwrap();
+                    Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+                },
+                || Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)),
+            )
+        });
+        let started = wait.recv_timeout(std::time::Duration::from_secs(2));
+        drop(state);
+        assert!(load.join().unwrap().is_err());
+        assert!(started.is_ok(), "the save lock blocked the cached load");
+    }
+
+    #[test]
     fn one_name_is_held_by_one_thread_at_a_time() {
         static NAMES: Names = Names::new();
         static INSIDE: AtomicU64 = AtomicU64::new(0);
@@ -611,10 +754,14 @@ mod tests {
                 }
             }
         }
-        let first = open(&device, Vec::new()).expect("an empty library");
+        let first = open(&device, PipelineBlob::Empty).expect("an empty library");
         let made = Shared(device.clone(), root.clone(), first.library.clone());
         (0..N).for_each(|i| made.store(i, &codes[i]));
-        let again = open(&device, made.serialized()).expect("the library again");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        write_atomically(&path, &made.serialized()).unwrap();
+        let again = open(&device, MappedBlob::open(&path).unwrap()).expect("the library again");
+        assert!(!again.blob.bytes().is_empty(), "the driver accepted the mapped library");
         let shared = Shared(device, root, again.library.clone());
         let stores = Mutex::new(());
         std::thread::scope(|s| {
@@ -645,10 +792,22 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let blob = PipelineBlob::Bytes(b"not a pipeline library".repeat(16));
+        let library = open(&device, blob).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
-        assert!(library._blob.is_empty());
+        assert!(library.blob.bytes().is_empty());
+    }
+
+    #[test]
+    fn a_mapped_pipeline_blob_stays_readable_after_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        write_atomically(&path, b"old cache").unwrap();
+        let old = MappedBlob::open(&path).unwrap();
+        write_atomically(&path, b"new cache").unwrap();
+        assert_eq!(old.bytes(), b"old cache");
+        assert_eq!(MappedBlob::open(&path).unwrap().bytes(), b"new cache");
     }
 
     #[test]

@@ -110,7 +110,7 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
+/// Runs the lists' host lists (decision 0007).
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -121,9 +121,9 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let host_lists: Vec<_> = lists
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .filter_map(|&l| crate::list::retain_host_list(l))
             .collect();
-        host.execute(&host_lists);
+        host.execute_title(host_lists);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -145,7 +145,7 @@ extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token:
     execute(this, count, lists);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// CPU-visible signals are published only after pending host work retires.
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -161,11 +161,18 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    crate::host::drain_pending();
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
+/// Preserve the synchronous queue boundary before a title queue wait.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    crate::host::drain_pending();
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -242,6 +249,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    crate::host::drain_pending();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();

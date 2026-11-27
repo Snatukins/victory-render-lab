@@ -370,7 +370,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<QueuedRead>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -388,7 +388,20 @@ struct Job {
     seq: u64,
     request: Request,
     staging: u64,
+    page_deadline: Option<std::time::Instant>,
 }
+
+struct QueuedRead {
+    seq: u64,
+    request: Request,
+    retry_at: Option<std::time::Instant>,
+    page_deadline: Option<std::time::Instant>,
+}
+
+// Allow the title time to fill a list during a loading stall. Bound the
+// wait so a list that never fills cannot hold its queue open indefinitely.
+const PAGE_LIST_RECHECK: std::time::Duration = std::time::Duration::from_millis(4);
+const PAGE_LIST_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
@@ -447,13 +460,52 @@ impl Scheduler {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let Some(job) = lanes.start(now) else {
+            lanes = match lanes.next_page_retry(now) {
+                Some(retry) => scheduler
+                    .work
+                    .wait_timeout(lanes, retry.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0,
+                None => scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner()),
+            };
             continue;
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let mut inline_pages = [0; 16];
+        let mut large_pages = Vec::new();
+        let result = match destination_pages(&job.request, &mut inline_pages, &mut large_pages) {
+            Ok(pages) if pages.contains(&0) => {
+                let deadline = job.page_deadline.unwrap_or(started + PAGE_LIST_WAIT);
+                let now = std::time::Instant::now();
+                if now < deadline {
+                    lanes = scheduler.lock();
+                    lanes.defer_page_list(&job, now, deadline);
+                    // Also wake a worker waiting for the staging space we returned.
+                    scheduler.work.notify_all();
+                    scheduler.finished.notify_all();
+                    continue;
+                }
+                tracing::warn!(
+                    pages = pages.len(),
+                    empty_pages = pages.iter().filter(|&&page| page == 0).count(),
+                    "dstorage: destination page list did not fill before the deadline"
+                );
+                Err(E_INVALIDARG)
+            }
+            Ok(pages) => {
+                if job.page_deadline.is_some() {
+                    let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if late.is_power_of_two() {
+                        tracing::info!(late, "dstorage: resumed requests with late destination page lists");
+                    }
+                }
+                execute(&job.request, pages)
+            }
+            Err(hr) => Err(hr),
+        };
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -483,7 +535,7 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
+            tracing::info!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
@@ -505,25 +557,32 @@ impl Lanes {
     /// Starts the next read of the class with the least virtual time, from
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
-    fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+    fn start(&mut self, now: std::time::Instant) -> Option<Job> {
+        let (_, class, _, _, id) = self.lanes.iter()
+            .filter_map(|(&id, lane)| {
+                let read = lane.reads.front()?;
+                if read.retry_at.is_some_and(|retry| retry > now) {
+                    return None;
+                }
+                Some((self.clock[lane.class], lane.class, lane.clock, read.seq, id))
+            })
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let QueuedRead { seq, request, page_deadline, .. } = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+        // Retrying a page list only probes the list; charge the transfer once.
+        let size = if page_deadline.is_none() {
+            u64::from(request.destination_size.max(request.source_size)).max(1)
+        } else {
+            0
+        };
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
@@ -533,7 +592,37 @@ impl Lanes {
             seq,
             request,
             staging,
+            page_deadline,
         })
+    }
+
+    fn next_page_retry(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.lanes.values().filter_map(|lane| lane.reads.front()?.retry_at)
+            .filter(|&retry| retry > now)
+            .min()
+    }
+
+    /// Give back the worker and its staging allowance without completing the
+    /// read. Keep the sequence number so subsequent statuses still wait for it.
+    fn defer_page_list(
+        &mut self,
+        job: &Job,
+        now: std::time::Instant,
+        deadline: std::time::Instant,
+    ) {
+        self.staged -= job.staging;
+        if let Some(lane) = self.lanes.get_mut(&job.lane) {
+            lane.running.remove(&job.seq);
+            if !lane.closed {
+                let index = lane.reads.partition_point(|read| read.seq < job.seq);
+                lane.reads.insert(index, QueuedRead {
+                    seq: job.seq,
+                    request: job.request,
+                    retry_at: Some((now + PAGE_LIST_RECHECK).min(deadline)),
+                    page_deadline: Some(deadline),
+                });
+            }
+        }
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
@@ -571,7 +660,12 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => lane.reads.push_back(QueuedRead {
+                    seq,
+                    request,
+                    retry_at: None,
+                    page_deadline: None,
+                }),
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -602,7 +696,7 @@ impl Lane {
     /// Writes the status entries whose earlier reads have all finished.
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
-            let waiting = self.reads.front().map(|r| r.0);
+            let waiting = self.reads.front().map(|read| read.seq);
             if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
                 return;
             }
@@ -620,16 +714,33 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Upper bound on temporary storage held by a running request. Physical
+/// pages may be scattered, so budget a staging copy even when the direct
+/// mapping succeeds and no copy is needed.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+    let compressed = request.options & (ZLIB | BCPACK) != 0;
+    let mut bytes = 0;
+    if compressed && request.options & MEMORY_SOURCE == 0 {
+        bytes += u64::from(request.source_size);
     }
+    if request.options & ZLIB != 0 && request.options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
+    }
+    if request.options & PAGE_DESTINATION != 0 {
+        let output = if compressed { request.destination_size } else { request.source_size };
+        bytes += u64::from(output);
+    }
+    bytes
+}
+
+fn staging_buffer(len: usize) -> Result<Vec<u8>, HRESULT> {
+    let mut bytes = Vec::new();
+    if let Err(error) = bytes.try_reserve_exact(len) {
+        tracing::warn!(len, %error, "dstorage: unable to allocate staging buffer");
+        return Err(E_OUTOFMEMORY);
+    }
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -792,7 +903,7 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, pages: &[usize]) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -821,21 +932,21 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, pages, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        let mut packed = staging_buffer(request.intermediate_size as usize).map_err(|hr| fail(hr, "allocating zlib staging"))?;
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    into_destination(request, pages, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -910,7 +1021,7 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = staging_buffer(size)?;
     read_into(request, &mut bytes)?;
     Ok(Cow::Owned(bytes))
 }
@@ -945,6 +1056,57 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
+/// Take a private copy of the title's page numbers before running the read.
+/// A title can still be filling the list after automatic submission. Use
+/// the OS copy so we don't form a Rust reference into those mutable bytes
+/// and an unreadable list is a failed request rather than an access fault.
+fn destination_pages<'a>(
+    request: &Request,
+    inline: &'a mut [usize],
+    large: &'a mut Vec<usize>,
+) -> Result<&'a [usize], HRESULT> {
+    if request.options & PAGE_DESTINATION == 0 {
+        return Ok(&[]);
+    }
+    let len = if request.options & (ZLIB | BCPACK) == 0 {
+        request.source_size.min(request.destination_size)
+    } else {
+        request.destination_size
+    } as usize;
+    if len == 0 || request.destination.is_null() {
+        return Ok(&[]);
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    let count = (offset + len).div_ceil(PAGE);
+    let pages = if count <= inline.len() {
+        &mut inline[..count]
+    } else {
+        large.try_reserve_exact(count).map_err(|_| E_OUTOFMEMORY)?;
+        large.resize(count, 0);
+        large.as_mut_slice()
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let bytes = std::mem::size_of_val(pages);
+    let mut read = 0;
+    // SAFETY: the output is local writable storage, sized for the entire
+    // copy. Windows validates the source address before reading it.
+    let copied = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            request.destination,
+            pages.as_mut_ptr().cast(),
+            bytes,
+            &mut read,
+        )
+    };
+    if copied == 0 || read != bytes {
+        tracing::warn!(count, "dstorage: unreadable destination page list");
+        return Err(E_INVALIDARG);
+    }
+    Ok(pages)
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -952,6 +1114,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// allocation, and otherwise go through a buffer.
 fn into_destination(
     request: &Request,
+    pages: &[usize],
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
@@ -965,61 +1128,32 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    if len == 0 {
+        return fill(&mut []).map(drop);
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
+    let mut data = staging_buffer(len)?;
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         return Ok(());
     }
-    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
-    // it is one the title has not filled yet. The title writes a request's
-    // page list after enqueueing it, and a queue half full is submitted on
-    // its own, so a read can start first. Read the list again for a few
-    // milliseconds before failing: the title never looks at a request's
-    // result, so a failed one is a model or texture left unwritten.
-    if pages.contains(&0) {
-        for _ in 0..LATE_LIST_TRIES {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            // SAFETY: as above; the title's list, read again.
-            let again = unsafe {
-                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
-            };
-            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
-                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
-                if late.is_power_of_two() {
-                    tracing::info!(
-                        late,
-                        "dstorage: a page list filled after its request started: written late"
-                    );
-                }
-                return Ok(());
-            }
-        }
-    }
+    let (empty_pages, unknown_pages) = super::xmem::page_write_failure(pages);
     tracing::warn!(
         offset,
         len,
         pages = pages.len(),
+        empty_pages,
+        unknown_pages,
         "dstorage: a destination's physical pages could not be written; its request fails"
     );
     Err(E_INVALIDARG)
 }
 
-/// Milliseconds a page list naming page 0 is read again for.
-const LATE_LIST_TRIES: u32 = 8;
-/// Page lists filled after their request started (written late).
+/// Deferred requests whose title page lists became ready.
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
@@ -1334,7 +1468,7 @@ mod tests {
         (0..3).for_each(|id| l.submit(id));
         let mut started = [0u32; 3];
         for _ in 0..330 {
-            let job = l.start().unwrap();
+            let job = l.start(std::time::Instant::now()).unwrap();
             started[job.lane as usize] += 1;
             l.finish(&job, Ok(()));
         }
@@ -1345,6 +1479,25 @@ mod tests {
     }
 
     #[test]
+    fn staging_budget_accounts_for_intermediate_and_scattered_output() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, MEMORY_SOURCE | ZLIB | BCPACK | PAGE_DESTINATION, 40);
+        let Command::Read(request) = &mut l.lanes.get_mut(&0).unwrap().unsubmitted[0] else {
+            unreachable!()
+        };
+        request.intermediate_size = 30;
+        read(&mut l, 0, MEMORY_SOURCE | PAGE_DESTINATION, 40);
+        l.submit(0);
+        let now = Instant::now();
+        let first = l.start(now).unwrap();
+        assert_eq!(first.staging, 70);
+        assert!(l.start(now).is_none(), "the second request would exceed the budget");
+        l.finish(&first, Ok(()));
+        assert_eq!(l.start(now).unwrap().staging, 40);
+    }
+
+    #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
         let mut l = lanes(100);
         l.lanes.insert(0, Lane::new(0, 64));
@@ -1352,18 +1505,57 @@ mod tests {
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
         l.submit(0);
-        let first = l.start().unwrap();
-        assert!(l.start().is_none(), "60 + 60 > 100");
+        let now = std::time::Instant::now();
+        let first = l.start(now).unwrap();
+        assert!(l.start(now).is_none(), "60 + 60 > 100");
         l.finish(&first, Ok(()));
-        let second = l.start().unwrap();
-        let raw = l.start().unwrap();
+        let second = l.start(now).unwrap();
+        let raw = l.start(now).unwrap();
         assert_eq!((second.staging, raw.staging), (60, 0));
         // Alone, a request larger than the buffer still runs.
         read(&mut l, 0, ZLIB, 500);
         l.submit(0);
-        assert!(l.start().is_none());
+        assert!(l.start(now).is_none());
         l.finish(&second, Ok(()));
-        assert!(l.start().is_some());
+        assert!(l.start(now).is_some());
+    }
+
+    #[test]
+    fn a_deferred_page_list_leaves_staging_free_and_keeps_its_status_pending() {
+        let now = Instant::now();
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(1, Lane::new(0, 64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        // SAFETY: an array we created with one entry.
+        let entries = unsafe { &(*array).state.entries };
+        entries[0].store(E_PENDING, Ordering::Release);
+        read(&mut l, 0, PAGE_DESTINATION, 100);
+        add_ref_instance(array);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status {
+            array, index: 0,
+        }));
+        read(&mut l, 1, ZLIB, 100);
+        l.submit(0);
+        l.submit(1);
+
+        let blocked = l.start(now).unwrap();
+        assert_eq!(blocked.lane, 0);
+        let deadline = now + PAGE_LIST_WAIT;
+        l.defer_page_list(&blocked, now, deadline);
+        let other = l.start(now).unwrap();
+        assert_eq!(other.lane, 1);
+        l.finish(&other, Ok(()));
+        assert_eq!(result(array.cast(), 0), E_PENDING);
+        assert!(l.start(now).is_none());
+        assert_eq!(l.next_page_retry(now), Some(now + PAGE_LIST_RECHECK));
+
+        let later = now + Duration::from_millis(40);
+        let retry = l.start(later).unwrap();
+        assert_eq!(retry.seq, blocked.seq);
+        assert_eq!(retry.page_deadline, Some(deadline));
+        l.finish(&retry, Ok(()));
+        assert_eq!(result(array.cast(), 0), S_OK);
     }
 
     #[test]
@@ -1385,7 +1577,8 @@ mod tests {
             entry.store(E_PENDING, Ordering::Release);
         }
         l.submit(0);
-        let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
+        let now = std::time::Instant::now();
+        let jobs: Vec<Job> = (0..3).map(|_| l.start(now).unwrap()).collect();
         // The last read and the first finish; the second then fails.
         l.finish(&jobs[2], Ok(()));
         l.finish(&jobs[0], Ok(()));
@@ -1546,32 +1739,81 @@ mod tests {
         assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
 
         // The title's list, still empty when the request is submitted.
-        let list = Box::leak(Box::new([0usize; 1]));
-        let at = std::ptr::from_mut(list) as usize;
+        let list = std::sync::atomic::AtomicUsize::new(0);
         let plain = pattern(4096);
         let (queue, array) = (new_queue(1), status_array(1));
         let r = request(
             PAGE_DESTINATION | MEMORY_SOURCE,
-            list.as_mut_ptr().cast(),
+            list.as_ptr().cast(),
             plain.len(),
             plain.as_ptr().cast(),
             0,
             plain.len(),
         );
-        let number = page[0];
-        let filler = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            // SAFETY: the leaked list, alive for the whole test.
-            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
-        });
         enqueue(queue, &r);
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
+        wait_for_page_retry(queue);
+        assert_eq!(result(array, 0), E_PENDING);
+        list.store(page[0], Ordering::Release);
         assert_eq!(wait(array, 0), S_OK);
-        filler.join().unwrap();
         // SAFETY: the page is mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
+    }
+
+    fn wait_for_page_retry(queue: *mut c_void) {
+        // SAFETY: a queue made by this test, still open.
+        let id = unsafe { (*queue.cast::<Instance<Queue>>()).state.id };
+        let scheduler = scheduler().unwrap();
+        let mut lanes = scheduler.lock();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !lanes.lanes[&id].reads.front().is_some_and(|read| read.page_deadline.is_some()) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "page list was never deferred");
+            lanes = scheduler.finished.wait_timeout(lanes, left).unwrap().0;
+        }
+    }
+
+    #[test]
+    fn an_empty_page_list_times_out_and_completes_its_status() {
+        let list = [0usize];
+        let source = [1u8];
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_ptr().cast_mut().cast(),
+            source.len(),
+            source.as_ptr().cast(),
+            0,
+            source.len(),
+        );
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), E_INVALIDARG);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn closing_a_queue_drops_a_deferred_page_list() {
+        let list = [0usize];
+        let source = [1u8];
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_ptr().cast_mut().cast(),
+            source.len(),
+            source.as_ptr().cast(),
+            0,
+            source.len(),
+        );
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        wait_for_page_retry(queue);
+        void(queue, 0x40);
+        assert_eq!(result(array, 0), E_PENDING);
     }
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {

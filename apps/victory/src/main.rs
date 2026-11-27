@@ -69,6 +69,9 @@ enum Command {
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Restrict inspection to a 16-digit shader hash from the GPU log.
+        #[arg(long, conflicts_with = "effects")]
+        hash: Option<String>,
         /// Instead list the effects of shader databases: technique, pass,
         /// shaders (name, container hash, engine hash) and pass state.
         #[arg(long)]
@@ -112,6 +115,9 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
+        /// Start the optional vi-rpc.exe next to the VIctory executable.
+        #[arg(long, requires = "execute")]
+        discord_presence: bool,
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
@@ -161,7 +167,8 @@ fn main() -> Result<()> {
             verbose,
             disasm,
             effects,
-        } => shader::run(paths, verbose || disasm, disasm, effects),
+            hash,
+        } => shader::run(paths, verbose || disasm || hash.is_some(), disasm, effects, hash.as_deref()),
         Command::Translate {
             paths,
             jobs,
@@ -182,10 +189,11 @@ fn main() -> Result<()> {
             unimplemented,
             strict,
             execute,
+            discord_presence,
             console,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let code = run::run(&exe, unimplemented, strict, execute, console, discord_presence)?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);
