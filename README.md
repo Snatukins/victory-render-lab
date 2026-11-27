@@ -68,8 +68,7 @@ Set `game_dir` in `victory.toml` to your title directory. See [local test proced
 
 ## Credits
 
-- **Snatukins** drove local RTX 4060 testing, reported what appeared on screen, and directed later integration and performance experiments.
-- **Codex-assisted local development** worked on descriptor bounds, shader metadata, capture diagnostics, and RTX 4060 launcher and cache integration. The optional priming edits came from the local working tree.
+- **[Snatukins](https://github.com/Snatukins)** leads VIctory Render Lab, including the RTX 4060 renderer integration, launcher and pipeline-cache work, and local graphics and performance testing.
 - **Marvisak and the VIctory contributors** built the compatibility layer. **Taynan Piza / TaynanGT and the Vice-Tay contributors** developed the imported renderer baseline. **Maxime Cambou** contributed NVIDIA profile tuning and reduced CPU waits for compatible fills.
 - Original authorship and imported commits are preserved. See the [full upstream contributor credits](docs/credits.md) and [GPL-3.0-or-later license](LICENSE).
 
