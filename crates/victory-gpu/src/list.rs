@@ -525,6 +525,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_copy(dst),
             crate::resource::host_copy(src),
         ) {
+            if crate::texture::incompatible_copy(from.packed(), to.packed()) {
+                return;
+            }
             sync_copy_source(list, src, &from);
             ensure_copy_state(list, &to, COPY_DEST);
             ensure_copy_state(list, &from, COPY_SOURCE);
@@ -593,6 +596,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let to = &to_copy.texture;
+        let packed = to_copy.packed();
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -604,24 +608,44 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some(footprint) = host_footprint(src.footprint, packed) else { return };
+            let Some(host_bytes) = footprint.bytes() else { return };
+            let Some((buffer, staging)) = list.upload(host, host_bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            if let Some(format) = packed {
+                let (data, staging) = (data as usize, staging as usize);
+                let Some((element, 1)) = crate::resource::element(format) else { return };
+                list.defer_host(move || {
+                    let mut guest = vec![0; bytes as usize];
+                    crate::host::copy_mapped(guest.as_mut_ptr(), data as *const u8, guest.len(), false);
+                    // SAFETY: the mapped upload spans the expanded footprint.
+                    let rgba = unsafe { std::slice::from_raw_parts_mut(staging as *mut u8, host_bytes as usize) };
+                    let row = footprint.width as usize * element as usize;
+                    for (src, dst) in guest.chunks(src.footprint.row_pitch as usize).zip(rgba.chunks_mut(footprint.row_pitch as usize)) {
+                        crate::texture::expand_row(format, &src[..row], dst);
+                    }
+                });
+            } else {
+                list.defer_fill(staging, data, bytes as usize);
+            }
+            from.footprint = footprint;
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, host_bytes));
             }
             _upload = buffer;
         } else {
             let Some(copy) = crate::resource::host_copy(src.resource) else {
                 return;
             };
+            if crate::texture::incompatible_copy(copy.packed(), packed) {
+                return;
+            }
             sync_copy_source(list, src.resource, &copy);
             ensure_copy_state(list, &copy, COPY_SOURCE);
             from.resource = copy.texture.as_raw().cast_const().cast();
@@ -672,6 +696,23 @@ extern "system" fn copy_texture_region(
     let _ = (this, dst, x, y, z, src, source_box);
 }
 
+/// Doubling a packed pitch preserves its alignment and doubles every texel offset.
+#[cfg(windows)]
+fn host_footprint(mut f: crate::resource::PlacedFootprint, packed: Option<u32>) -> Option<crate::resource::PlacedFootprint> {
+    f.offset = 0;
+    if let Some(format) = packed {
+        let (element, _) = crate::resource::element(format)?;
+        if f.format != format || f.width == 0 || f.height == 0 || f.depth == 0
+            || u64::from(f.width) * element > u64::from(f.row_pitch) || !f.row_pitch.is_multiple_of(256)
+        {
+            return None;
+        }
+        f.format = crate::resource::expanded_format(format)?;
+        f.row_pitch = f.row_pitch.checked_mul(2)?;
+    }
+    Some(f)
+}
+
 #[cfg(windows)]
 fn copy_texture_to_buffer(
     list: &crate::host::HostList,
@@ -691,6 +732,8 @@ fn copy_texture_to_buffer(
     // SAFETY: the host copy is pinned for the rest of recording.
     let desc = unsafe { copy.texture.GetDesc() };
     let fp = dst.footprint;
+    let packed = copy.packed();
+    let Some(host_fp) = host_footprint(fp, packed) else { return };
     let Some((element, 1)) = crate::resource::element(fp.format) else { return };
     let mips = u32::from(desc.MipLevels).max(1);
     let volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -700,7 +743,7 @@ fn copy_texture_to_buffer(
         || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
         || matches!(fp.format, 19..=22 | 44..=47 | 68..=69 | 116..=120 | 189..=191)
         || subresource >= mips * layers
-        || crate::resource::family(desc.Format.0 as u32) != crate::resource::family(fp.format)
+        || crate::resource::family(desc.Format.0 as u32) != crate::resource::family(host_fp.format)
         || fp.row_pitch == 0
         || !fp.row_pitch.is_multiple_of(256)
         || u64::from(fp.width) * element > u64::from(fp.row_pitch)
@@ -736,13 +779,14 @@ fn copy_texture_to_buffer(
     // omit the last row's padding.
     let title_size = size - row_pitch + fp.width as usize * element as usize;
     let Some(title) = buffer_range(dst.resource, fp.offset, title_size as u64) else { return };
-    let Some((buffer, mapped)) = host.shared_buffer(size as u64) else { return };
+    let Some(host_size) = size.checked_mul(if packed.is_some() { 2 } else { 1 }) else { return };
+    let Some((buffer, mapped)) = host.shared_buffer(host_size as u64) else { return };
     list.keep(&buffer);
     sync_copy_source(list, src.resource, &copy);
     ensure_copy_state(list, &copy, COPY_SOURCE);
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
-    to.footprint.offset = 0;
+    to.footprint = host_fp;
     let from = CopyLocation { resource: copy.texture.as_raw().cast_const().cast(), ..src };
     // SAFETY: validated regions; live resources held by the list. A buffer
     // created in COMMON supports implicit promotion to COPY_DEST.
@@ -759,6 +803,7 @@ fn copy_texture_to_buffer(
         row_bytes: extent[0] as usize * element as usize,
         rows: extent[1] as usize,
         slices: extent[2] as usize,
+        packed,
     });
 }
 
@@ -797,6 +842,10 @@ extern "system" fn resolve(
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        let packed = crate::resource::packed_format(dst);
+        if crate::texture::incompatible_copy(crate::resource::packed_format(src), packed) {
+            return;
+        }
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
@@ -807,7 +856,7 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
+            let format = if packed.is_some() { a.Format } else { DXGI_FORMAT(format as i32) };
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -1149,6 +1198,7 @@ impl Drop for Upload {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
         crate::shadow::unregister(self.at, self.at as u64);
+        let _mapping = crate::watch::changing_title_mapping();
         // Not guarded any more: memory allocated here next is new.
         crate::watch::title_memory_remapped(self.at, self.len);
         // SAFETY: our allocation; lists that still use its copy hold that.
@@ -1458,6 +1508,8 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::note_indirect_request();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -1941,17 +1993,18 @@ mod tests {
             footprint,
         };
         let release = |o| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut title_list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title_list),
+            S_OK,
+        );
+        let list = host_list(title_list).unwrap();
         let mut results = Vec::new();
         for (region, color) in [
             (false, [1.0f32, 2.0, 3.0, 4.0]),
             (true, [5.0f32, 6.0, 7.0, 8.0]),
         ] {
-            let mut title_list = null;
-            assert_eq!(
-                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title_list),
-                S_OK,
-            );
-            let list = host_list(title_list).unwrap();
+            // The second clear changes the GPU source after the alias's first use.
             ensure_state(list, writer, RENDER_TARGET);
             // SAFETY: the open list holds a live render target in the correct state.
             unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
@@ -1983,22 +2036,21 @@ mod tests {
                     None,
                 );
             }
-            list.close();
-            host.execute(&[list]);
+            results.push((readback, mapped, color));
+        }
+        list.close();
+        host.execute(&[list]);
+        for (_readback, mapped, color) in results {
             // SAFETY: execute has waited for the copy into the mapped buffer.
             let rows = unsafe { std::slice::from_raw_parts(mapped, 1024) };
             let texel = color.map(f32::to_le_bytes).concat();
             let expected = texel.repeat(4);
-            results.push((
-                region,
-                rows.chunks_exact(256).all(|row| row[..64] == expected),
-            ));
-            assert_eq!(release(title_list), 0);
+            assert!(rows.chunks_exact(256).all(|row| row[..64] == expected), "{color:?}");
         }
+        assert_eq!(release(title_list), 0);
         for object in [destination, alias, writer, allocator] {
             assert_eq!(release(object), 0);
         }
-        assert_eq!(results, [(false, true), (true, true)]);
     }
 
     #[cfg(windows)]
@@ -2086,3 +2138,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod packed_copy_tests;

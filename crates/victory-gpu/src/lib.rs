@@ -20,6 +20,8 @@
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -53,6 +55,10 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod shared_heap;
+#[cfg(windows)]
+pub use shared_heap::{enabled as title_shared_heap_enabled, mapped as title_shared_heap_mapped};
 pub mod signature;
 mod switch;
 #[cfg(windows)]
@@ -66,8 +72,12 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::{finish_pending, on_failure};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use shadow::writeback_audit::audit_storage_write;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use watch::crash_mapping_aliases;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    Writing as KernelWrite, changing_title_mapping, title_memory_aliased, title_memory_remapped,
     writing as kernel_will_write,
 };

@@ -355,7 +355,9 @@ impl State {
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(list, record.resource);
+            if !crate::capture::compact() {
+                crate::capture::note_target(list, record.resource);
+            }
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -365,7 +367,9 @@ impl State {
             let desc = record.depth_desc();
             self.depth_state = depth_target_state(desc.as_ref());
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(list, record.resource);
+            if !crate::capture::compact() {
+                crate::capture::note_target(list, record.resource);
+            }
             Some(host.dsv(texture, desc.as_ref()))
         });
         // SAFETY: an open list; the views were just made.
@@ -511,6 +515,12 @@ impl State {
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, self.depth_state);
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::compact() && crate::capture::listed(crate::queue::presented() + 1) {
+            for t in self.targets.iter().copied().chain((self.depth != 0).then_some(self.depth)) {
+                crate::capture::note_render_output(t as This, &p.name);
+            }
         }
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
         if list.take_rebind() {
@@ -1868,10 +1878,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_input(*resource as This);
-            if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+            if let Some(copy) = crate::resource::host_copy(*resource as This)
+                && crate::texture::title_written(&copy.texture)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, *resource as This, &copy.texture);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]

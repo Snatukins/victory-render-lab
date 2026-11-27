@@ -38,7 +38,12 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "diagnostics")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::Win32::Graphics::Direct3D12::{ID3D12DescriptorHeap, ID3D12Resource};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    ID3D12CommandAllocator, ID3D12CommandList, ID3D12DescriptorHeap, ID3D12GraphicsCommandList,
+    ID3D12Resource,
+};
+use windows::core::Interface;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
@@ -214,7 +219,8 @@ struct Layout {
 struct Shared {
     /// Keep the host heap alive and distinguish it from a recycled title handle.
     heap: ID3D12DescriptorHeap,
-    _table: ID3D12Resource,
+    upload: ID3D12Resource,
+    card: Option<CardTable>,
     data: usize,
     gpu: u64,
     /// The pair of null views entries without a copy name.
@@ -224,6 +230,84 @@ struct Shared {
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
+}
+
+/// A shader-readable VRAM copy of a table that the CPU builds in upload memory.
+/// It keeps one stable address for recorded and replayed command lists.
+struct CardTable {
+    buffer: ID3D12Resource,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    pending_bytes: u64,
+}
+
+const CARD_TABLE_BYTES: u64 = TABLE_BYTES.next_multiple_of(64 << 10);
+static CARD_TABLE_USAGE: Mutex<u64> = Mutex::new(0);
+
+impl CardTable {
+    fn new(host: &crate::host::Host) -> Option<Self> {
+        let mut allocated = CARD_TABLE_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+        let (budget, used) = host.local_video_memory()?;
+        // Reserve room for Series X textures and render targets. Count the
+        // full allocation even if only a few table blocks have entries.
+        if *allocated + CARD_TABLE_BYTES > 128 << 20
+            || budget.saturating_sub(used) < (1 << 30) + CARD_TABLE_BYTES
+        {
+            return None;
+        }
+        let buffer = host.default_buffer_in_state(TABLE_BYTES, D3D12_RESOURCE_STATE_COMMON)?;
+        crate::host::name(&buffer, || "title memory page table in VRAM".into());
+        // SAFETY: plain creation on the selected device.
+        let (allocator, list) = unsafe {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList = host
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .ok()?;
+            list.Close().ok()?;
+            (allocator, list)
+        };
+        *allocated += CARD_TABLE_BYTES;
+        tracing::info!(
+            resident_mib = *allocated as f64 / (1 << 20) as f64,
+            local_budget_mib = budget >> 20,
+            local_used_mib = used >> 20,
+            "title memory page table allocated in VRAM"
+        );
+        Some(Self { buffer, allocator, list, pending_bytes: 0 })
+    }
+
+    fn record(&mut self, source: &ID3D12Resource) -> windows::core::Result<Option<ID3D12CommandList>> {
+        if self.pending_bytes == 0 {
+            return Ok(None);
+        }
+        // SAFETY: table submissions wait for retirement before rewriting or
+        // resetting this list. The upload resource is already in GENERIC_READ.
+        unsafe {
+            self.allocator.Reset()?;
+            self.list.Reset(&self.allocator, None)?;
+            self.list.CopyBufferRegion(&self.buffer, 0, source, 0, self.pending_bytes);
+            self.list.ResourceBarrier(&[crate::host::transition(
+                &self.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+            self.list.Close()?;
+        }
+        let list = self.list.cast()?;
+        tracing::debug!(bytes = self.pending_bytes, "uploaded changed title memory page table to VRAM");
+        self.pending_bytes = 0;
+        Ok(Some(list))
+    }
+}
+
+impl Drop for CardTable {
+    fn drop(&mut self) {
+        *CARD_TABLE_USAGE.lock().unwrap_or_else(|e| e.into_inner()) -= CARD_TABLE_BYTES;
+    }
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -436,17 +520,22 @@ impl Shared {
     /// A page table for `heap`, named nothing yet (written at the first
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
-        let (table, data) = crate::host::host()?.upload_buffer(TABLE_BYTES)?;
+        let host = crate::host::host()?;
+        let (table, data) = host.upload_buffer(TABLE_BYTES)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
+        let card = crate::switch::on("VICTORY_VRAM_PAGE_TABLES")
+            .then(|| CardTable::new(host))
+            .flatten();
         // SAFETY: a live buffer.
-        let gpu = unsafe { table.GetGPUVirtualAddress() };
+        let gpu = unsafe { card.as_ref().map_or(&table, |card| &card.buffer).GetGPUVirtualAddress() };
         #[cfg(feature = "diagnostics")]
         TABLE_COUNT.fetch_add(1, Ordering::Relaxed);
         Some(Shared {
             heap: heap.heap.clone(),
-            _table: table,
+            upload: table,
+            card,
             data: data as usize,
             gpu,
             null,
@@ -515,6 +604,9 @@ impl Shared {
             std::slice::from_raw_parts_mut(self.data as *mut u32, LEVEL1 + 2 * owner.len())
         };
         write_table(data, &level1, &owner, &ranges, &slots, self.null);
+        if let Some(card) = &mut self.card {
+            card.pending_bytes = size_of_val(data) as u64;
+        }
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
             copies: named,
@@ -532,6 +624,58 @@ impl Shared {
 pub(crate) struct PreparedTable {
     layout: Arc<Layout>,
     maps: Vec<Arc<RecordedMap>>,
+}
+
+impl PreparedTable {
+    pub(crate) fn card_upload(&self) -> windows::core::Result<Option<ID3D12CommandList>> {
+        let Some(map) = self.maps.first() else { return Ok(None) };
+        let mut table = map.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Shared { upload, card, .. } = &mut *table;
+        match card {
+            Some(card) => card.record(upload),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Before-images for direct page-table writes to memory without CPU tracking.
+/// Keep a fixed budget per submission under memory pressure.
+#[derive(Default)]
+pub(crate) struct UntrackedWrites {
+    before: HashMap<usize, Vec<u8>>,
+    retired: HashSet<(usize, usize)>,
+}
+
+impl UntrackedWrites {
+    pub(crate) fn capture<'a>(tables: impl Iterator<Item = &'a PreparedTable>) -> Self {
+        const BUDGET: usize = 64 << 20;
+        let mut out = Self::default();
+        let mut remaining = BUDGET;
+        let mut seen = HashSet::new();
+        let mut copies: Vec<_> = tables
+            .flat_map(|table| &table.layout.copies)
+            .filter(|copy| !copy.tracked() && seen.insert(Arc::as_ptr(copy)))
+            .collect();
+        copies.sort_unstable_by_key(|copy| copy.range());
+        for copy in copies {
+            if let Some(bytes) = copy.snapshot_untracked(remaining) {
+                remaining -= bytes.len();
+                out.before.insert(Arc::as_ptr(copy) as usize, bytes);
+            }
+        }
+        out
+    }
+
+    fn publish(&mut self, copy: &Arc<Shadow>, page: usize) -> usize {
+        if copy.tracked() {
+            return copy.copy_back_page(page, None);
+        }
+        let key = Arc::as_ptr(copy) as usize;
+        if !self.retired.insert((key, page)) {
+            return 0;
+        }
+        copy.copy_back_page(page, self.before.get(&key).map(Vec::as_slice))
+    }
 }
 
 impl PreparedTable {
@@ -593,7 +737,12 @@ impl RecordedMap {
         })
     }
 
-    pub(crate) fn copy_back(&self, table: &PreparedTable, list_missed: bool) {
+    pub(crate) fn copy_back(
+        &self,
+        table: &PreparedTable,
+        list_missed: bool,
+        untracked: &mut UntrackedWrites,
+    ) {
         let Layout {
             copies,
             blocks,
@@ -646,7 +795,7 @@ impl RecordedMap {
                 copies[k].invalidate(at, crate::watch::PAGE);
                 continue;
             }
-            let n = copies[k].copy_back_page(at);
+            let n = untracked.publish(&copies[k], at);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),
@@ -837,24 +986,60 @@ void main() { dst.Store(0, value); }
             // SAFETY: the test owns this live allocation until the end of the test.
             unsafe { (at as *const u8).read() }
         };
+        let mut untracked = UntrackedWrites::default();
         mark(page);
         mark(missing);
         assert!(map.recorded.missed(&table));
-        map.recorded.copy_back(&table, false);
+        map.recorded.copy_back(&table, false, &mut untracked);
         assert_eq!(first_byte(), 0);
         assert!(!map.recorded.missed(&table), "retirement clears the bitmap");
         mark(page);
-        map.recorded.copy_back(&table, true);
+        map.recorded.copy_back(&table, true, &mut untracked);
         assert_eq!(first_byte(), 0, "a miss in another heap's bitmap blocks copy-back");
         assert!(!map.recorded.missed(&table), "the clean bitmap is also cleared");
         assert_eq!(copy.update(at, page_size, None), page_size);
         assert_eq!(copy.read_host(at as u64, 1), [0], "the rejected output was discarded");
         copy.write_host(at as u64, &[7]);
         mark(page);
-        map.recorded.copy_back(&table, false);
+        map.recorded.copy_back(&table, false, &mut untracked);
         assert_eq!(first_byte(), 7);
         crate::shadow::unregister(at, at as u64);
         drop(table);
+        crate::watch::tests::free(at);
+    }
+
+    #[test]
+    fn untracked_page_merge_keeps_the_cpu_pointer_and_publishes_gpu_changes() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let len = crate::watch::PAGE;
+        // SAFETY: private, committed memory. Deliberately omit MEM_WRITE_WATCH.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        crate::shadow::register(at, at as u64, len as u64);
+        if let Some(copy) = crate::shadow::find(at as u64, len as u64) {
+            assert!(!copy.tracked());
+            // The old value looks like GPU data, but only the CPU changes it now.
+            const OLD: u64 = 0xfc00fc00fc007c00;
+            let pointer = at as u64 + 64;
+            // SAFETY: the fixture owns the entire page, with these fields aligned.
+            unsafe { (at as *mut u64).write(OLD) };
+            copy.update(at, len, None);
+            let table = PreparedTable {
+                layout: Arc::new(Layout { copies: vec![copy.clone()], ..Layout::default() }),
+                maps: Vec::new(),
+            };
+            let mut writes = UntrackedWrites::capture(std::iter::once(&table));
+            // SAFETY: the title replaces the former data with a pointer.
+            unsafe { (at as *mut u64).write(pointer) };
+            copy.write_host((at + 16) as u64, &[7]);
+            assert_eq!(UntrackedWrites::default().publish(&copy, at), 0);
+            assert_eq!(writes.publish(&copy, at), 1);
+            // SAFETY: the fixture is still live.
+            assert_eq!(unsafe { ((at as *const u64).read(), ((at + 16) as *const u8).read()) },
+                (pointer, 7));
+            assert_eq!(writes.publish(&copy, at), 0, "shared maps retire a page once");
+        }
+        crate::shadow::unregister(at, at as u64);
         crate::watch::tests::free(at);
     }
 
@@ -1023,6 +1208,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let maps = record([memory[0] + 16, memory[1] + PAGE]);
         assert_eq!(maps[0].table, maps[1].table, "one table for the heap");
+        if crate::switch::on("VICTORY_VRAM_PAGE_TABLES") {
+            let shared = maps[0].recorded.shared.lock().unwrap();
+            // SAFETY: both buffers remain alive through their recorded uses.
+            unsafe {
+                if let Some(card) = &shared.card {
+                    assert_eq!(maps[0].table, card.buffer.GetGPUVirtualAddress());
+                    assert_ne!(maps[0].table, shared.upload.GetGPUVirtualAddress());
+                    eprintln!("page table uses VRAM (local budget and usage in bytes: {:?})", host.local_video_memory());
+                } else {
+                    assert_eq!(maps[0].table, shared.upload.GetGPUVirtualAddress());
+                    eprintln!("page table uses the system-memory fallback");
+                }
+            }
+        }
         assert_ne!(maps[0].dirty, maps[1].dirty, "a bitmap per list");
         fill(memory[0] + 16, 0x100);
         fill(memory[1] + PAGE, 0x200);

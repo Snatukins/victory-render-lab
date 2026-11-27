@@ -111,7 +111,8 @@ fn wave32_only() -> bool {
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let wave32_only = wave32_only();
     let compute_wave_first_reduce = wave32_only && needs_wave_first_reduction(container);
-    if !compute_wave_first_reduce
+    let wave64_split = wave32_only && split_wave64(container);
+    if !wave64_split
         && let Some((cache, build)) = COMPATIBLE_CACHE.get()
         && let Some(shader) = compatible_entry(cache, build, container)
     {
@@ -126,6 +127,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
             wave32_only,
             wave64_group_collectives: wave32_only && bvh_rehydration(container),
             compute_wave_first_reduce,
+            wave64_split,
         };
         victory_shader::emit::translate_with(container, options).map_err(|e| e.to_string())
     };
@@ -133,6 +135,20 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
     }
+}
+
+/// Wave64 compute programs validated and created on an RTX Wave32 device.
+/// Other programs keep the existing lowering, including the BVH builder.
+fn split_wave64(container: &[u8]) -> bool {
+    matches!(
+        blake3::hash(container).to_hex().as_str(),
+        "14394a322f6dd5c2e2714b27fac2118f3a122bf9252e1c38fff36ccdb7284178"
+            | "660814153af43185df06b9317c830f000ccbcdf2d2ec0b388005bc6faf81dfe1"
+            | "f8f50ab85e7b10bb4bcca02acb1aab32e5a19cc1b8145a933229edd29e00bc80"
+            | "b22a16a178976e1b070d0f362af14aa8ad2cdb1f2d8d2a10173013321379c52f"
+            // Alpha transmission mip prefilter.
+            | "2da4beb386509b770efc386571eec4ea75c7975d5010e865d59d1a286329901c"
+    )
 }
 
 fn needs_wave_first_reduction(container: &[u8]) -> bool {

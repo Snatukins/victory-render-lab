@@ -344,7 +344,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// (the others then find it in the library); different names overlap.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
@@ -365,6 +365,12 @@ pub(crate) fn pipeline(
         Err(error) if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY => return Err(error),
         Err(_) => {}
     }
+    if let Some(seed) = seed_library()
+        && let Ok(pso) = load(&seed.loads, PCWSTR(wide.as_ptr()))
+    {
+        LOADED.fetch_add(1, Ordering::Relaxed);
+        return Ok(pso);
+    }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
@@ -377,6 +383,21 @@ pub(crate) fn pipeline(
         l.added += 1;
     }
     Ok(pso)
+}
+
+/// Optional read-only library from an earlier build. Exact host names and
+/// D3D12 descriptions are required even when shader cache revisions differ.
+fn seed_library() -> Option<&'static SharedLibrary> {
+    static SEED: OnceLock<Option<SharedLibrary>> = OnceLock::new();
+    SEED.get_or_init(|| {
+        let path = PathBuf::from(std::env::var_os("VICTORY_PIPELINE_SEED")?);
+        let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+        let blob = MappedBlob::open(&path).map_err(|error| {
+            tracing::warn!(%error, path = %path.display(), "could not open pipeline seed");
+        }).ok()?;
+        let library = open(&device, blob)?;
+        Some(SharedLibrary { loads: library.library.clone(), state: Mutex::new(library) })
+    }).as_ref()
 }
 
 #[cfg(feature = "diagnostics")]

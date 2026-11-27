@@ -69,7 +69,14 @@ impl Changed {
         if !saved.armed.contains(&page) || saved.bytes.contains_key(&page) {
             return;
         }
-        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
+        let mut bytes = Vec::new();
+        // This can run in a vectored exception handler during memory pressure.
+        // A missing before-image makes retirement preserve the title's bytes.
+        if bytes.try_reserve_exact(PAGE).is_err() {
+            return;
+        }
+        bytes.resize(PAGE, 0);
+        let mut bytes = bytes.into_boxed_slice();
         if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
             saved.bytes.insert(page, bytes);
             #[cfg(feature = "diagnostics")]
@@ -195,12 +202,102 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// The destination pages of a copy and every registered view of them.
+pub(crate) fn write_ranges(at: usize, len: usize) -> (u64, Vec<(usize, usize)>) {
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    let mut ranges = vec![(first * PAGE, last.saturating_mul(PAGE))];
+    let g = guards();
+    for &page in g.alias_of.range(first..last).flat_map(|(_, others)| others) {
+        crate::host::add_range(&mut ranges, page * PAGE, (page + 1) * PAGE);
+    }
+    (mapping_version(), ranges)
+}
+
+static MAPPING_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REMAP_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REMAPS: Mutex<std::collections::VecDeque<(u64, usize, usize)>> =
+    Mutex::new(std::collections::VecDeque::new());
+static MAPPING_IO: std::sync::RwLock<()> = std::sync::RwLock::new(());
+thread_local! {
+    static WRITEBACK_REMAPS: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hold across changes to the Windows mappings and tracker notification.
+pub fn changing_title_mapping() -> std::sync::RwLockWriteGuard<'static, ()> {
+    MAPPING_IO.write().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn remap_version() -> u64 {
+    REMAP_VERSION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) struct WritebackMapping {
+    _mapping: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+impl WritebackMapping {
+    pub(crate) fn begin(version: u64) -> Self {
+        let mapping = MAPPING_IO.read().unwrap_or_else(|e| e.into_inner());
+        if version != remap_version() {
+            let remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+            WRITEBACK_REMAPS.with_borrow_mut(|ranges| {
+                // If churn evicted an event, its destination cannot be verified.
+                if remaps.front().is_some_and(|&(oldest, _, _)| oldest - 1 > version) {
+                    ranges.push((0, usize::MAX));
+                } else {
+                    for &(_, first, last) in remaps.iter().rev().take_while(|r| r.0 > version) {
+                        crate::host::add_range(ranges, first, last);
+                    }
+                }
+            });
+        }
+        Self { _mapping: mapping }
+    }
+}
+
+impl Drop for WritebackMapping {
+    fn drop(&mut self) {
+        WRITEBACK_REMAPS.with_borrow_mut(Vec::clear);
+    }
+}
+
+/// Whether a destination may refer to different storage than at preparation.
+pub(crate) fn stale_gpu_destination(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    WRITEBACK_REMAPS.with_borrow(|ranges| {
+        let i = ranges.partition_point(|&(_, end)| end <= first);
+        ranges.get(i).is_some_and(|&(start, _)| start < last)
+    })
+}
+
+pub(crate) fn mapping_version() -> u64 {
+    MAPPING_VERSION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Other virtual addresses of a byte in game memory. The crash reporter
+/// must not block if an exception interrupted the guard owner.
+#[cfg(feature = "diagnostics")]
+pub fn crash_mapping_aliases(at: usize) -> Vec<usize> {
+    let Ok(g) = GUARDS.try_lock() else { return Vec::new() };
+    g.alias_of.get(&(at / PAGE)).into_iter().flatten().take(32)
+        .map(|&page| page * PAGE + at % PAGE)
+        .collect()
+}
+
 /// Guards the other mappings and returns pages with an alias still open.
 fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
     if pairs.is_empty() {
         return BTreeSet::new();
     }
-    let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
+    let mut others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
+    others.sort_unstable();
+    others.dedup();
     let guarded: BTreeSet<_> = protect(g, &others).into_iter().collect();
     pairs.iter().filter_map(|&(p, a)| (!guarded.contains(&a)).then_some(p)).collect()
 }
@@ -327,27 +424,28 @@ impl Tracked {
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
             .collect();
-        // Every address showing the same pages is guarded too. A write in
-        // between marks them changed again; the copy, made after, has it.
-        #[cfg(feature = "diagnostics")]
-        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "diagnostics")]
-        drop(waited);
-        #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(&g, &whole);
-        let open_aliases = guard_aliases(&mut g, &others);
-        #[cfg(feature = "diagnostics")]
-        drop(asked);
-        whole.retain(|p| !open_aliases.contains(p));
-        for page in protect(&mut g, &whole) {
-            changed.remove(&page);
-            self.changed.taken(page);
+        // Partial pages remain dirty and need no changes to the guard set.
+        if !whole.is_empty() {
+            // Every address showing the same pages is guarded too. A write
+            // in between marks them changed again; the later copy has it.
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let mut g = guards();
+            let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            #[cfg(feature = "diagnostics")]
+            let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+            let others = aliases(&g, &whole);
+            let open_aliases = guard_aliases(&mut g, &others);
+            #[cfg(feature = "diagnostics")]
+            drop(asked);
+            whole.retain(|p| !open_aliases.contains(p));
+            for page in protect(&mut g, &whole) {
+                changed.remove(&page);
+                self.changed.taken(page);
+            }
         }
-        drop(changed);
-        drop(g);
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
@@ -504,8 +602,29 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 
 fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
-        open(g, page);
+    for run in guarded.chunk_by(|a, b| *a + 1 == *b) {
+        if run.len() == 1 {
+            open(g, run[0]);
+            continue;
+        }
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let mut old = 0;
+        // SAFETY: these adjacent pages are all in the guard set. If they
+        // straddle Windows allocations, fall back to opening each separately.
+        let opened = unsafe {
+            VirtualProtect((run[0] * PAGE) as *const _, run.len() * PAGE, PAGE_READWRITE, &mut old)
+        } != 0;
+        if opened {
+            for page in run {
+                g.protected.remove(page);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::OpenPages, run.len() as u64);
+        } else {
+            for &page in run {
+                open(g, page);
+            }
+        }
     }
 }
 
@@ -573,8 +692,23 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    crate::shared_heap::unmapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    MAPPING_VERSION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    {
+        const HISTORY: usize = 4096;
+        let mut remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if remaps.len() == HISTORY {
+            remaps.pop_front();
+        }
+        let version = remap_version() + 1;
+        remaps.push_back((version, first, last));
+        REMAP_VERSION.store(version, std::sync::atomic::Ordering::Release);
+    }
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
@@ -593,12 +727,23 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::shadow::note_mapping_change(at, len);
 }
 
+/// The GPU wrote the section itself. Dirty any copies of these pages and
+/// their aliases so later submissions can see the new contents.
+pub(crate) fn shared_heap_written(at: usize, len: usize) {
+    if len != 0 && !stale_gpu_destination(at, len) {
+        changed(&mut guards(), at / PAGE, at.saturating_add(len).div_ceil(PAGE), false);
+    }
+}
+
 /// The runtime mapped the page at `at` where `others` show it already: the
 /// pages are linked both ways, and if we guard it there, it is guarded here
 /// too (a write through the new mapping must not go unseen by the trackers
 /// there).
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
     let mut g = guards();
+    if !others.is_empty() {
+        MAPPING_VERSION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
     let page = at / PAGE;
     for &other in others {
         for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {

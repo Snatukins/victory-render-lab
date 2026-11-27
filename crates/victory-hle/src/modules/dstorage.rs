@@ -21,8 +21,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -144,7 +144,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File::new(file, direct_io()));
     put(out, file)
 }
 
@@ -258,6 +258,92 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    direct: Box<[OnceLock<Option<std::fs::File>>]>,
+}
+
+fn direct_io() -> bool {
+    static DIRECT: OnceLock<bool> = OnceLock::new();
+    *DIRECT.get_or_init(|| {
+        let direct = std::env::var("VICTORY_DSTORAGE_IO").is_ok_and(|mode| mode.trim() == "direct");
+        if direct {
+            tracing::info!("dstorage: direct file reads enabled");
+        }
+        direct
+    })
+}
+
+impl File {
+    fn new(file: std::fs::File, direct: bool) -> Self {
+        let workers = if direct { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { 0 };
+        Self { file, direct: (0..workers).map(|_| OnceLock::new()).collect() }
+    }
+
+    /// Vice-Tay's direct read mode (fbc1830): reopen the same file per
+    /// worker, bypassing Windows' file cache. A filesystem that refuses
+    /// direct reads continues through the original handle.
+    fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        if !self.direct.is_empty() {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            thread_local! {
+                static SLOT: usize = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
+            let slot = SLOT.with(|id| *id % self.direct.len());
+            if let Some(file) = self.direct[slot].get_or_init(|| reopen_direct(&self.file))
+                && let Ok(n) = read_direct(file, out, offset)
+                && n != 0
+            {
+                return Ok(n);
+            }
+        }
+        self.file.seek_read(out, offset)
+    }
+}
+
+fn reopen_direct(file: &std::fs::File) -> Option<std::fs::File> {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_SHARE_READ, ReOpenFile};
+    // SAFETY: The original file stays open throughout the call.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_NO_BUFFERING) };
+    if handle == INVALID_HANDLE_VALUE {
+        tracing::debug!(error = %std::io::Error::last_os_error(), "dstorage: could not reopen file for direct reads");
+        return None;
+    }
+    // SAFETY: The newly opened handle is ours.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    const ALIGN: usize = 4096;
+    const CHUNK: usize = 1 << 20;
+    if out.is_empty() {
+        return Ok(0);
+    }
+    if offset.is_multiple_of(ALIGN as u64)
+        && out.len().is_multiple_of(ALIGN)
+        && (out.as_ptr() as usize).is_multiple_of(ALIGN)
+    {
+        let count = out.len().min(CHUNK);
+        return file.seek_read(&mut out[..count], offset);
+    }
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUFFER.with_borrow_mut(|buffer| {
+        if buffer.is_empty() {
+            buffer.try_reserve_exact(CHUNK + ALIGN).map_err(std::io::Error::other)?;
+            buffer.resize(CHUNK + ALIGN, 0);
+        }
+        let start = buffer.as_ptr().align_offset(ALIGN);
+        let prefix = (offset % ALIGN as u64) as usize;
+        let count = (prefix + out.len().min(CHUNK)).next_multiple_of(ALIGN).min(CHUNK);
+        let aligned = &mut buffer[start..start + count];
+        let n = file.seek_read(aligned, offset - prefix as u64)?;
+        let n = n.saturating_sub(prefix).min(out.len());
+        if n != 0 {
+            out[..n].copy_from_slice(&aligned[prefix..prefix + n]);
+        }
+        Ok(n)
+    })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -1037,16 +1123,14 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match file.read_at(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1122,6 +1206,8 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
         let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
+        #[cfg(feature = "diagnostics")]
+        victory_gpu::audit_storage_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1317,6 +1403,24 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    #[test]
+    fn direct_reads_handle_unaligned_offsets_and_a_partial_last_sector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.bin");
+        let data: Vec<u8> = (0..8192 + 113).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let Some(direct) = reopen_direct(&file) else {
+            eprintln!("test volume does not support direct reads");
+            return;
+        };
+        let mut out = [0; 80];
+        assert_eq!(read_direct(&direct, &mut out, 4087).unwrap(), 80);
+        assert_eq!(out, data[4087..4167]);
+        assert_eq!(read_direct(&direct, &mut out, 8265).unwrap(), 40);
+        assert_eq!(out[..40], data[8265..]);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! interrupted pre-build keeps its work, and the next one finds those
 //! pipelines there.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,7 +38,14 @@ enum Job {
 
 pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let started = Instant::now();
-    pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
+    let cfg = victory_core::Config::load()?;
+    pipeline::use_pipeline_cache(crate::pipeline_cache_dir(&cfg)?);
+    // A targeted warm-up takes exact title pipeline keys, one per line.
+    // The key includes render state, so matching a shader alone is insufficient.
+    let selection = std::env::var_os("VICTORY_PREBUILD_ONLY")
+        .map(std::fs::read_to_string).transpose()?
+        .map(|keys| keys.lines().map(str::trim).filter(|key| !key.is_empty())
+            .map(str::to_owned).collect::<HashSet<_>>());
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
@@ -201,19 +208,38 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
     let listed = AtomicUsize::new(0);
+    let matched = Mutex::new(HashSet::new());
     each(&jobs, threads, |job| match prepare(job) {
         Ok(p) if keys_only.is_some() => {
             lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
         }
-        Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
-        Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
+        Ok(p) => {
+            let key = p.key();
+            if let Some(selection) = &selection
+                && (!selection.contains(&key) || !lock(&matched).insert(key.clone()))
+            {
+                return;
+            }
+            // Explicit selections check the driver library itself.
+            if selection.is_none() && pipeline::prebuilt(&key) {
+                listed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                lock(&todo).push((!pipeline::wanted_early(&key), job));
+            }
+        }
         Err(why) => {
             if keys_only.is_some() {
                 lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
             }
-            skip(why);
+            if selection.is_none() {
+                skip(why);
+            }
         }
     });
+    if let Some(selection) = &selection {
+        let matched = lock(&matched);
+        println!("targeted     {} of {} runtime pipeline keys match the pack", matched.len(), selection.len());
+    }
     let listed = listed.into_inner();
     if let Some(file) = keys_only {
         std::fs::write(file, lock(&lines).join("\n"))?;

@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -27,6 +27,7 @@ use crate::watch::PAGE;
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    shared: Option<crate::shared_heap::Backing>,
     #[cfg(feature = "diagnostics")]
     buffer_bytes: u64,
     data: *mut u8,
@@ -67,6 +68,8 @@ struct Snapshot {
     covered: Vec<(usize, usize)>,
     /// Bytes already retired or excluded due to a missing shader input.
     compared: Vec<(usize, usize)>,
+    /// Ranges without a before-image because the allocation failed.
+    missing: Vec<(usize, usize)>,
 }
 
 /// Gaps in a sorted union of ranges, clipped to `[from, to)`.
@@ -102,14 +105,23 @@ impl Snapshot {
         mut read: impl FnMut(usize, usize, &mut Vec<u8>),
     ) -> usize {
         let mut captured = 0;
+        let mut covered_to = from;
         for (start, end) in gaps(&self.covered, from, to) {
-            let mut bytes = pooled(end - start);
+            let Some(mut bytes) = pooled(end - start) else {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(size = end - start, "could not allocate GPU write snapshot");
+                });
+                crate::host::add_range(&mut self.missing, start, to);
+                break;
+            };
             read(start, end, &mut bytes);
             self.segments.insert(start, bytes);
             captured += end - start;
+            covered_to = end;
         }
         if captured != 0 {
-            crate::host::add_range(&mut self.covered, from, to);
+            crate::host::add_range(&mut self.covered, from, covered_to);
         }
         captured
     }
@@ -134,23 +146,24 @@ static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool {
 });
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
-fn pooled(n: usize) -> Vec<u8> {
-    if n < MIN_POOLED_BYTES {
-        return Vec::with_capacity(n);
+fn pooled(n: usize) -> Option<Vec<u8>> {
+    if n >= MIN_POOLED_BYTES {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let fit = pool.buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| (n..=n.saturating_mul(2)).contains(&v.capacity()))
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i);
+        if let Some(i) = fit {
+            let mut bytes = pool.buffers.swap_remove(i);
+            bytes.clear();
+            return Some(bytes);
+        }
     }
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool.buffers
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| (n..=n.saturating_mul(2)).contains(&v.capacity()))
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.buffers.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(n).ok()?;
+    Some(bytes)
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
@@ -238,6 +251,13 @@ pub(crate) mod writeback_audit {
 
     impl Retirement {
         pub(crate) fn begin(fence: u64) -> Self {
+            open();
+            FENCE.set(fence);
+            Self
+        }
+    }
+
+    fn open() {
             JOURNAL.get_or_init(|| {
                 let path = std::env::var_os("VICTORY_WRITEBACK_AUDIT")?;
                 match std::fs::File::create(path) {
@@ -248,9 +268,6 @@ pub(crate) mod writeback_audit {
                     }
                 }
             });
-            FENCE.set(fence);
-            Self
-        }
     }
 
     impl Drop for Retirement {
@@ -267,19 +284,31 @@ pub(crate) mod writeback_audit {
     /// Fixed 32-byte records: sequence, fence, address, byte count, path.
     /// Path 1 is a native compare/write piece that may contain untouched bytes.
     /// Path 2 is an exact byte run.
-    pub(super) fn record(address: usize, len: usize, path: u32) {
-        let Some(Some(journal)) = JOURNAL.get() else { return };
+    /// Path 3 is a texture readback row.
+    /// Paths 4 and 5 are a deferred CPU copy and a queue completion write.
+    pub(crate) fn record(address: usize, len: usize, path: u32) {
         let fence = FENCE.get();
         if fence == 0 {
             return;
         }
+        append(address, len, path, fence);
+    }
+
+    /// Path 6 is an asynchronous DirectStorage write, without a GPU fence.
+    pub fn audit_storage_write(address: usize, len: usize) {
+        open();
+        append(address, len, 6, 0);
+    }
+
+    fn append(address: usize, len: usize, path: u32, fence: u64) {
+        let Some(Some(journal)) = JOURNAL.get() else { return };
         let mut journal = journal.lock().unwrap_or_else(|e| e.into_inner());
         let sequence = journal.sequence + 1;
         let mut row = [0; 32];
         row[..8].copy_from_slice(&sequence.to_le_bytes());
         row[8..16].copy_from_slice(&fence.to_le_bytes());
         row[16..24].copy_from_slice(&(address as u64).to_le_bytes());
-        row[24..28].copy_from_slice(&(len as u32).to_le_bytes());
+        row[24..28].copy_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes());
         row[28..].copy_from_slice(&path.to_le_bytes());
         let result = (|| {
             if journal.sequence != 0 && journal.sequence % RECORDS == 0 {
@@ -450,10 +479,18 @@ impl Shadow {
     /// submission, and what differs is what the GPU wrote). Returns the
     /// bytes written; a page the title wrote meanwhile keeps the title's
     /// bytes (logged once).
-    pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_page(&self, page: usize, untracked_before: Option<&[u8]>) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
+            return 0;
+        }
+        if self.is_shared() {
+            self.shared_written(from, to - from);
+            return 0;
+        }
+        if crate::watch::stale_gpu_destination(from, to - from) {
+            self.invalidate(from, to - from);
             return 0;
         }
         if let Some(t) = &self.tracked
@@ -469,8 +506,19 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
+        let offset = from - start;
+        let before = if self.tracked.is_none() {
+            let Some(bytes) = untracked_before.and_then(|bytes| bytes.get(offset..offset + n)) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("untracked GPU page write withheld without a before-image"));
+                return 0;
+            };
+            Some(bytes)
+        } else {
+            None
+        };
         // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(offset), n) };
         let mut title = vec![0u8; n];
         if !crate::host::read_into(from as *const u8, &mut title) || title == host {
             return 0;
@@ -481,7 +529,25 @@ impl Shadow {
         // The pre-write title bytes are our baseline for a clean page.
         // Merge only the differences so a CPU store elsewhere on the page
         // can survive. Keep the page dirty for the next refresh.
-        write_gpu_delta(from, &title, host, &title)
+        write_gpu_delta(from, before.unwrap_or(&title), host, &title)
+    }
+
+    pub(crate) fn tracked(&self) -> bool {
+        self.tracked.is_some()
+    }
+
+    /// Copy the GPU-visible before-image after the last refresh and before
+    /// execution. This copy has no title write tracker to provide a baseline.
+    pub(crate) fn snapshot_untracked(&self, budget: usize) -> Option<Vec<u8>> {
+        let len = usize::try_from(self.len).ok()?;
+        if self.is_shared() || self.tracked() || len > budget {
+            return None;
+        }
+        let mut before = Vec::new();
+        before.try_reserve_exact(len).ok()?;
+        // SAFETY: preparation has finished and the GPU has yet to run.
+        before.extend_from_slice(unsafe { std::slice::from_raw_parts(self.data, len) });
+        Some(before)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -492,8 +558,19 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        let tracked = crate::watch::track(start as usize, len as usize, true);
-        let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
+        Self::with_backing(buffer, data, gpu, start, len, None)
+    }
+
+    fn with_backing(
+        buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64,
+        shared: Option<crate::shared_heap::Backing>,
+    ) -> Arc<Shadow> {
+        let tracked = if shared.is_some() {
+            None
+        } else {
+            crate::watch::track(start as usize, len as usize, true)
+        };
+        let marks = (tracked.is_some() || shared.is_some()).then(|| marks().take(pages(start, len))).flatten();
         #[cfg(feature = "diagnostics")]
         let buffer_bytes = {
             // SAFETY: the live buffer was allocated for this copy.
@@ -503,6 +580,7 @@ impl Shadow {
         };
         let shadow = Arc::new(Shadow {
             buffer,
+            shared,
             #[cfg(feature = "diagnostics")]
             buffer_bytes,
             data,
@@ -516,6 +594,20 @@ impl Shadow {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    fn current(&self) -> bool {
+        self.shared.as_ref().is_none_or(|backing| backing.is_current())
+    }
+
+    fn shared_written(&self, address: usize, len: usize) {
+        if self.current() {
+            crate::watch::shared_heap_written(address, len);
+        }
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -587,6 +679,9 @@ impl Shadow {
         marked: bool,
     ) {
         submission.pending.insert((address, address + len));
+        if self.is_shared() {
+            return;
+        }
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
             submission.armed = true;
@@ -660,6 +755,11 @@ impl Shadow {
         len: usize,
         back: bool,
     ) -> usize {
+        if self.is_shared() {
+            submission.pending.remove(&(address, address + len));
+            self.shared_written(address, len);
+            return 0;
+        }
         let Submission {
             pending,
             before,
@@ -676,6 +776,9 @@ impl Shadow {
             }
             // A later declaration must not replay bytes already merged into title memory.
             crate::host::add_range(&mut before.compared, from, to);
+        } else if back && before.missing.iter().any(|&(a, b)| a < to && b > from) {
+            // Keep the title's bytes when the baseline is unavailable.
+            self.invalidate(address, len);
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
@@ -683,6 +786,7 @@ impl Shadow {
         if pending.is_empty() {
             before.covered.clear();
             before.compared.clear();
+            before.missing.clear();
             for (_, bytes) in std::mem::take(&mut before.segments) {
                 give_back(bytes);
             }
@@ -711,6 +815,11 @@ impl Shadow {
             while at < end {
                 let address = start + at;
                 let n = (PAGE - address % PAGE).min(end - at);
+                if crate::watch::stale_gpu_destination(address, n) {
+                    self.invalidate(address, n);
+                    at += n;
+                    continue;
+                }
                 // SAFETY: this segment is within the host mapping. The GPU
                 // has finished writing it and only retirement changes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -740,6 +849,10 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
+            return None;
+        }
+        if crate::watch::stale_gpu_destination(from, to - from) {
+            self.invalidate(from, to - from);
             return None;
         }
         // Writes from this batch must not save a new image for this slice.
@@ -781,41 +894,21 @@ impl Shadow {
         len: usize,
         submission: Option<&mut Submission>,
     ) -> usize {
+        if self.is_shared() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return 0;
         }
-        if let Some(submission) = submission {
-            let mut busy: Vec<_> = submission
-                .pending
-                .iter()
-                .copied()
-                .filter(|&(a, e)| a < to && e > from)
-                .collect();
-            if busy.is_empty() {
-                return self.update_free(from, to);
-            }
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame). Under them, what the title
-            // wrote since it was taken (`update_busy`).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                let (a, e) = (a.max(from), e.min(to));
-                if a > at {
-                    bytes += self.update_free(at, a);
-                }
-                if e > a.max(at) {
-                    bytes += self.update_busy(submission, a.max(at), e);
-                }
-                at = at.max(e);
-            }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
+        // All refreshes finish before this submission executes. A run can
+        // cross writable ranges; only the bytes held in snapshots need
+        // to be refreshed in both the host copy and the snapshot.
+        if let Some(submission) = submission
+            && !submission.before.segments.is_empty()
+        {
+            return self.update_busy(submission, from, to);
         }
         self.update_free(from, to)
     }
@@ -1064,6 +1157,10 @@ struct MarkedSlice {
 
 impl MarkedSlice {
     fn commit(self, scratch: &mut [u8]) -> usize {
+        if crate::watch::stale_gpu_destination(self.from, self.before.len()) {
+            self.copy.invalidate(self.from, self.before.len());
+            return 0;
+        }
         let title = &mut scratch[..self.before.len()];
         // Read the latest title bytes for the merge. Other slices may
         // have written this page since the batch captured its baselines.
@@ -1124,6 +1221,10 @@ fn copy_back_marks(b: &Bitmap, withheld: &[(Arc<Shadow>, usize, usize)]) {
     let mut scratch = vec![0; PAGE];
     let mut staged = Vec::new();
     for (copy, start, end) in coalesce_marked(pages) {
+        if copy.is_shared() {
+            copy.shared_written(start, end - start);
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(
@@ -1181,11 +1282,17 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+type RegisteredBuffers = BTreeMap<(u64, usize), Entry>;
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+/// Title buffers by (start address, resource), with their copy once made.
+static BUFFERS: RwLock<RegisteredBuffers> = RwLock::new(BTreeMap::new());
+
+fn buffer_key(map: &RegisteredBuffers, address: u64, end: u64) -> Option<(u64, usize)> {
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(&key, _)| key)
 }
 
 /// Counts copies made and title buffers released: [`all`] may differ when
@@ -1203,7 +1310,7 @@ fn changed() {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner()).insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -1214,7 +1321,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    if BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+        .remove(&(start, resource)).is_some_and(|e| e.shadow.is_some())
+    {
         changed();
     }
 }
@@ -1223,20 +1332,41 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    {
+        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        let Some(key) = buffer_key(&map, address, end) else {
+            drop(map);
+            return loose(address, end);
+        };
+        if let Some(shadow) = &map[&key].shadow
+            && shadow.current()
+        {
+            return Some(shadow.clone());
+        }
+    }
+    let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    // Another thread may have registered, removed, or allocated this buffer.
+    let Some(key) = buffer_key(&map, address, end) else {
         drop(map);
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.as_ref().is_some_and(|shadow| !shadow.current()) {
+        entry.shadow = None;
+        changed();
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        if let Some((buffer, backing)) = crate::shared_heap::place(key.0, len) {
+            let data = backing.data();
+            // SAFETY: A live placed buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            crate::host::name(&buffer, || format!("shared title buffer {:#x}+{len:#x}", key.0));
+            let shadow = Shadow::with_backing(buffer, data, gpu, key.0, len, Some(backing));
+            entry.shadow = Some(shadow.clone());
+            changed();
+            return Some(shadow);
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -1266,18 +1396,51 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
 const WINDOW: u64 = 4 << 20;
+const PRESSURE_WINDOW: u64 = 512 << 10;
+static COMPACT_WINDOWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn loose_window_size() -> u64 {
-    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// Use smaller new windows before shader compiles run out of commit.
+/// Existing windows stay in use so recorded GPU addresses remain valid.
+pub(crate) fn note_window_commit(available: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const GIB: usize = 1 << 30;
+    if window_override().is_some() {
+        return;
+    }
+    let next = if available < 8 * GIB {
+        true
+    } else if available >= 10 * GIB {
+        false
+    } else {
+        return;
+    };
+    if COMPACT_WINDOWS.swap(next, Relaxed) != next {
+        tracing::info!(
+            available_commit_mib = available >> 20,
+            window_kib = loose_window_size() >> 10,
+            "adjusted new loose buffer windows for Windows commit headroom"
+        );
+    }
+}
+
+fn window_override() -> Option<u64> {
+    static SIZE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let bytes = std::env::var("VICTORY_WINDOW_KB")
+        std::env::var("VICTORY_WINDOW_KB")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .and_then(|kb| kb.checked_mul(1024))
             .filter(|&bytes| bytes.is_power_of_two() && (PAGE as u64..=WINDOW).contains(&bytes))
-            .unwrap_or(WINDOW);
-        tracing::info!(window_kib = bytes / 1024, "loose shadow window size");
-        bytes
+    })
+}
+
+fn loose_window_size() -> u64 {
+    window_override().unwrap_or_else(|| {
+        if COMPACT_WINDOWS.load(std::sync::atomic::Ordering::Relaxed) {
+            PRESSURE_WINDOW
+        } else {
+            WINDOW
+        }
     })
 }
 
@@ -1304,7 +1467,7 @@ impl LooseCopy {
 }
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<LooseWindows<LooseCopy>> = Mutex::new(LooseWindows {
+static LOOSE: RwLock<LooseWindows<LooseCopy>> = RwLock::new(LooseWindows {
     entries: BTreeMap::new(),
     longest: 0,
 });
@@ -1335,6 +1498,14 @@ impl<T> LooseWindows<T> {
             .range((first, 0)..=(start, u64::MAX))
             .filter(|((base, size), _)| base.checked_add(*size).is_some_and(|last| last >= end))
             .min_by_key(|((_, size), _)| *size)
+    }
+}
+
+impl LooseWindows<LooseCopy> {
+    fn candidate(&self, window: (u64, u64), pages: (u64, u64)) -> Option<(&(u64, u64), &LooseCopy)> {
+        self.covering(window.0, window.1)
+            .filter(|(_, copy)| copy.live().is_some())
+            .or_else(|| self.covering(pages.0, pages.1))
     }
 }
 
@@ -1392,7 +1563,7 @@ pub(crate) fn reconcile_loose_mappings() {
     let Some((first, last)) = changes else { return };
     let mut evicted = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let earliest = first.saturating_sub(map.longest);
         for (&(start, len), copy) in map.entries.range_mut((earliest, 0)..(last, 0)) {
             if start + len <= first {
@@ -1443,13 +1614,16 @@ static LOOSE_STATS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let (start, len) = aligned_window(address, end, loose_window_size())?;
-    let (page_start, page_len) = aligned_window(address, end, PAGE as u64)?;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let cached = map.covering(start, len)
-        .filter(|(_, copy)| copy.live().is_some())
-        .or_else(|| map.covering(page_start, page_len));
-    if let Some((&key, copy)) = cached {
+    let window = aligned_window(address, end, loose_window_size())?;
+    let pages = aligned_window(address, end, PAGE as u64)?;
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map.candidate(window, pages).and_then(|(_, copy)| copy.live()) {
+            return Some(reuse_loose_copy(shadow, window));
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((&key, copy)) = map.candidate(window, pages) {
         if let LooseCopy::Unmapped(old) = copy {
             if let Some(shadow) = old.upgrade().or_else(|| new_loose_copy(key.0, key.1)) {
                 map.insert(key, LooseCopy::Live(shadow.clone()));
@@ -1457,25 +1631,29 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
                 return Some(shadow);
             }
         } else if let Some(shadow) = copy.live() {
-            #[cfg(feature = "diagnostics")]
-            {
-                use std::sync::atomic::Ordering::Relaxed;
-                if shadow.start == start && shadow.len == len {
-                    LOOSE_STATS[0].fetch_add(1, Relaxed);
-                } else {
-                    LOOSE_STATS[1].fetch_add(1, Relaxed);
-                    LOOSE_STATS[2].fetch_add(len, Relaxed);
-                }
-            }
-            return Some(shadow.clone());
+            return Some(reuse_loose_copy(shadow, window));
         }
     }
     // A full cache window can fail to allocate even when the requested
     // pages still fit. Keep the fallback page-aligned for indirect access.
-    let (key, shadow) = allocate_loose_window((start, len), (page_start, page_len), new_loose_copy)?;
+    let (key, shadow) = allocate_loose_window(window, pages, new_loose_copy)?;
     map.insert(key, LooseCopy::Live(shadow.clone()));
     changed();
     Some(shadow)
+}
+
+fn reuse_loose_copy(shadow: &Arc<Shadow>, _window: (u64, u64)) -> Arc<Shadow> {
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        if shadow.range() == _window {
+            LOOSE_STATS[0].fetch_add(1, Relaxed);
+        } else {
+            LOOSE_STATS[1].fetch_add(1, Relaxed);
+            LOOSE_STATS[2].fetch_add(_window.1, Relaxed);
+        }
+    }
+    shadow.clone()
 }
 
 fn allocate_loose_window<T>(
@@ -1540,7 +1718,7 @@ pub(crate) fn log_views(frames: f64) {
     let [exact, covering, avoided_bytes, created, evicted, reclaimed_bytes] =
         LOOSE_STATS.each_ref().map(|s| s.swap(0, Relaxed));
     let (windows, bytes, unmapped) = {
-        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         let (windows, bytes) = map.entries.values().filter_map(LooseCopy::live)
             .fold((0, 0), |(n, bytes), copy| (n + 1, bytes + copy.len));
         (windows, bytes, map.entries.len() - windows)
@@ -1604,21 +1782,22 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).entries.values().filter_map(LooseCopy::live).cloned());
+    let mut all: Vec<Arc<Shadow>> = BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+        .values().filter_map(|e| e.shadow.clone()).collect();
+    all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).entries.values().filter_map(LooseCopy::live).cloned());
     all
 }
 
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = BUFFERS.read().unwrap_or_else(|e| e.into_inner())
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .entries
             .values()
@@ -1703,6 +1882,26 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn concurrent_lookups_share_the_same_loose_window() {
+        if host().is_none() {
+            return;
+        }
+        let at = crate::watch::tests::pool(1);
+        let together = std::sync::Barrier::new(4);
+        let copies = std::thread::scope(|scope| {
+            let users = (0..4).map(|_| scope.spawn(|| {
+                together.wait();
+                loose(at as u64, (at + PAGE) as u64).unwrap()
+            })).collect::<Vec<_>>();
+            users.into_iter().map(|user| user.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert!(copies.iter().all(|copy| Arc::ptr_eq(copy, &copies[0])));
+        crate::watch::tests::free(at);
+        note_mapping_change(at, PAGE);
+        crate::host::drain_pending();
+    }
 
     #[test]
     fn unmapped_window_preserves_held_copy_and_rebuilds_released_copy_on_remap() {
@@ -1834,9 +2033,53 @@ mod tests {
         assert_eq!(snapshot.segments[&7], [7]);
     }
 
+    #[test]
+    fn unavailable_snapshot_keeps_existing_coverage_and_can_retry() {
+        let mut snapshot = Snapshot::default();
+        let fill = |from, to, bytes: &mut Vec<u8>| bytes.resize(to - from, 0x5a);
+        assert_eq!(snapshot.capture(0, 16, fill), 16);
+        assert_eq!(snapshot.capture(0, usize::MAX, fill), 0);
+        assert!(snapshot.covers(0, 16));
+        assert!(!snapshot.covers(16, 32));
+        assert_eq!(snapshot.missing, [(16, usize::MAX)]);
+        assert_eq!(snapshot.capture(0, 32, fill), 16);
+        assert!(snapshot.covers(0, 32));
+    }
+
     /// Ranges shaders write far apart are kept apart (not the copy between
     /// them); what the GPU wrote goes back once, whichever overlapping
     /// ranges declared it, and nothing else does.
+    #[test]
+    fn a_remapped_page_never_receives_the_previous_submissions_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        if let Some(copy) = find(p as u64, len as u64) {
+            let mut submission = Submission::default();
+            copy.update(p, len, None);
+            copy.writing(&mut submission, p, len, false);
+            let version = crate::watch::remap_version();
+            {
+                let _mapping = crate::watch::changing_title_mapping();
+                crate::watch::title_memory_remapped(p + PAGE, PAGE);
+                // SAFETY: the fixture owns the page; this supplies its replacement contents.
+                unsafe { ((p + PAGE) as *mut u8).write_volatile(9) };
+            }
+            copy.write_host(p as u64, &[7]);
+            copy.write_host((p + PAGE) as u64, &[8]);
+            {
+                let _mapping = crate::watch::WritebackMapping::begin(version);
+                assert_eq!(copy.copy_back(&mut submission, p, len), 1);
+            }
+            // SAFETY: both pages are live and the merge has finished.
+            assert_eq!(unsafe { (*(p as *const u8), *((p + PAGE) as *const u8)) }, (7, 9));
+            copy.update(p, len, None);
+            assert_eq!(copy.read_host((p + PAGE) as u64, 1), [9]);
+        }
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
     #[test]
     fn overlapping_snapshot_cannot_publish_withheld_bytes() {
         let p = crate::watch::tests::pool(1);

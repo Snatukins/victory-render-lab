@@ -57,9 +57,14 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    // Before the import registry is first used: it holds the module only
-    // when the host's FidelityFX serves.
-    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+    // Select the host upscaler before the HLE import registry is used.
+    if let Some(dir) = std::env::var_os("VICTORY_DLSS_DIR").filter(|value| !value.is_empty()) {
+        let dir = Path::new(&dir);
+        victory_hle::modules::fidelityfx::use_dlss_dir(dir)
+            .map_err(|error| anyhow::anyhow!("loading DLSS from {}: {error}", dir.display()))?;
+    } else {
+        victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -75,7 +80,9 @@ pub fn run(
     }
 
     let images = cfg.cache_subdir("images")?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    victory_hle::modules::d3d12x::use_shader_cache(
+        cfg.cache_subdir("shaders")?, crate::pipeline_cache_dir(&cfg)?,
+    );
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
@@ -114,7 +121,11 @@ pub fn run(
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
-        victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        let path = title_dir.join(name);
+        victory_hle::runtime::set_image_path(dll.base(), &path);
+        if name.eq_ignore_ascii_case("XboxBvhBuilder.dll") {
+            register_console_bvh_shaders(&path)?;
+        }
     }
     let imported: Vec<&str> = image
         .info()
@@ -215,6 +226,22 @@ fn start_discord_presence() -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+fn register_console_bvh_shaders(path: &Path) -> Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let hashes = crate::shader::sources(&bytes)
+        .iter()
+        .filter_map(|source| {
+            let bytes = source.bytes()?;
+            // The scanner has checked raw headers. Packed records can be bad.
+            let size = u32::from_le_bytes(bytes.get(0x18..0x1c)?.try_into().ok()?) as usize;
+            Some(blake3::hash(bytes.get(..size)?))
+        })
+        .collect();
+    victory_gpu::pipeline::register_console_bvh_shaders(hashes);
+    Ok(())
+}
+
+#[cfg(windows)]
 fn check_startup_archive(path: &Path) -> Result<()> {
     use std::io::Read;
 
@@ -248,6 +275,32 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     let size = image.info().size_of_image as usize;
     let ranges = std::env::var("VICTORY_CRASH_SAVE").unwrap_or_default();
     let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    // Comma-separated RVA:register:offset[:offset] probes (hex numbers).
+    let probes = std::env::var("VICTORY_CRASH_POINTERS").unwrap_or_default();
+    let legacy = std::env::var("VICTORY_CRASH_RDI_CHAIN").unwrap_or_default();
+    let chains = probes.split(',').chain(legacy.split_once(':').map(|_| legacy.as_str()))
+        .filter_map(|spec| {
+            let (rva, rest) = spec.split_once(':')?;
+            use victory_loader::CrashRoot;
+            let (root, offsets) = match rest.split_once(':') {
+                Some(("rdi", offsets)) => (CrashRoot::Rdi, offsets),
+                Some(("rdx", offsets)) => (CrashRoot::Rdx, offsets),
+                Some(("rcx", offsets)) => (CrashRoot::Rcx, offsets),
+                Some(("pool", offsets)) => (CrashRoot::PoolEntry, offsets),
+                _ if spec == legacy => (CrashRoot::Rdi, rest),
+                _ => return None,
+            };
+            let rva = hex(rva).filter(|&rva| rva < size)?;
+            let offsets = offsets.split(':').take(5).map(hex).collect::<Option<Vec<_>>>()?;
+            (offsets.len() <= 4).then_some(victory_loader::CrashChain {
+                instruction: image.base() + rva,
+                root,
+                offsets,
+            })
+        })
+        .take(8)
+        .collect();
+    victory_loader::trace_pointer_chains_on_crash(chains, victory_gpu::crash_mapping_aliases);
     victory_loader::save_on_crash(
         ranges
             .split(',')

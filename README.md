@@ -97,6 +97,16 @@ and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run.
 
+On NVIDIA RTX, use the optional DLSS 4.5 adapter with Series S. Build it
+against the [NVIDIA DLSS SDK v310.9.16](https://github.com/NVIDIA/DLSS/releases/tag/v310.9.16)
+with Visual Studio C++ Build Tools, then select its output folder.
+
+```powershell
+.\crates\victory-hle\native\build-dlss.ps1 -SdkDir <DLSS SDK folder> -OutputDir <adapter folder>
+$env:VICTORY_DLSS_DIR = '<adapter folder>'
+target\diag\victory.exe run --console series-s --execute '<title executable>'
+```
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
@@ -189,6 +199,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHARED_GRAPHICS_HEAP=1` | experimentally places the title's 174 MiB graphics buffer in its original physical pages on hosts that can open the shared heap |
+| `VICTORY_DSTORAGE_IO=direct` | reads DirectStorage files through per-worker unbuffered handles, with buffered reads as a fallback |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

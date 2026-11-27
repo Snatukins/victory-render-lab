@@ -1,6 +1,7 @@
 //! `amd_fidelityfx_loader_xbox.dll`: AMD FidelityFX's API, served by the
 //! host's PC build of it on the host GPU when the user names a folder that
-//! holds one (`VICTORY_FIDELITYFX_DIR`). Without it, or if it offers no
+//! holds one (`VICTORY_FIDELITYFX_DIR`), or a DLSS adapter is selected
+//! (`VICTORY_DLSS_DIR`). Without one, or if FidelityFX offers no
 //! upscaler for the host GPU, this module stays out of the registry and the
 //! title's own console DLLs run as before.
 //!
@@ -31,6 +32,7 @@ use crate::{HleModule, hle_export};
 
 /// The PC build's upscaler, which has the five functions itself.
 const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
+const DLSS_DLL: &str = "victory_dlss.dll";
 
 // Return codes.
 const OK: u32 = 0;
@@ -146,10 +148,17 @@ macro_rules! once {
     }};
 }
 
-/// Serves the title's FidelityFX calls with the PC upscaler in `dir`
-/// (`VICTORY_FIDELITYFX_DIR`) if it offers one for the host GPU; else the
-/// title's own DLLs run. Call once, before the import registry is first
-/// used: it holds this module only when serving.
+/// Selects the DLSS adapter before the title's import registry is used.
+pub fn use_dlss_dir(dir: &Path) -> Result<(), String> {
+    let (host, versions) = load_provider(dir, DLSS_DLL)?;
+    HOST.set(host)
+        .map_err(|_| "upscaler already selected".to_owned())?;
+    tracing::info!(folder = %dir.display(), versions, "DLSS: the host adapter serves the title's upscaler");
+    Ok(())
+}
+
+/// Selects the PC FidelityFX upscaler for a supported GPU. Call before
+/// building the import registry.
 pub fn use_host_dir(dir: Option<&Path>) {
     let Some(dir) = dir else {
         tracing::info!(
@@ -175,15 +184,19 @@ pub(crate) fn serving() -> bool {
 }
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
+    load_provider(dir, DLL)
+}
+
+fn load_provider(dir: &Path, dll: &str) -> Result<(Host, String), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
         LoadLibraryExW,
     };
     // The search flags below want a full path.
-    let path = std::path::absolute(dir.join(DLL)).map_err(|e| e.to_string())?;
+    let path = std::path::absolute(dir.join(dll)).map_err(|e| e.to_string())?;
     if !path.is_file() {
-        return Err(format!("no {DLL} there"));
+        return Err(format!("no {dll} there"));
     }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // Its own folder and System32 only, never the current folder.
@@ -192,7 +205,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
     let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), search) };
     if module.is_null() {
         return Err(format!(
-            "{DLL} did not load ({})",
+            "{dll} did not load ({})",
             std::io::Error::last_os_error()
         ));
     }
@@ -200,7 +213,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
         // SAFETY: a loaded module and a NUL-terminated name.
         unsafe { GetProcAddress(module, name.as_ptr().cast()) }
             .map(|f| f as *const c_void)
-            .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
+            .ok_or_else(|| format!("{dll} has no {}", name.to_string_lossy()))
     };
     let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
     // SAFETY: the API's exports, with its signatures.
@@ -369,8 +382,13 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
-    // These carry the console device.
-    if kind == GET_VERSIONS || kind == MEMORY_USAGE_WITH_DEVICE {
+    if kind == GET_VERSIONS {
+        let mut query = unsafe { desc.cast::<GetVersions>().read() };
+        query.device = host.device.as_raw();
+        return unsafe { (host.query)(context, &raw mut query.header) };
+    }
+    // The V2 memory query carries the console device and a different layout.
+    if kind == MEMORY_USAGE_WITH_DEVICE {
         once!(
             warn,
             kind = format_args!("{kind:#x}"),
@@ -402,6 +420,7 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
     let list = dispatch.list.cast::<Object>().cast_const();
+    let output = dispatch.resources[6].resource.cast::<Object>();
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     for r in dispatch
@@ -429,12 +448,18 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format.0
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
+    let code = victory_gpu::external::record(list, |host_list| {
         dispatch.list = host_list.as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
         unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
     })
-    .unwrap_or(PARAMETER)
+    .unwrap_or(PARAMETER);
+    if code == OK && !output.is_null() {
+        victory_gpu::external::texture_written(output);
+    } else if code != OK {
+        once!(warn, code, "host upscaler dispatch failed");
+    }
+    code
 }
 
 pub(crate) fn module() -> HleModule {

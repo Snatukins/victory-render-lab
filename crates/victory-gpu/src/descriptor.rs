@@ -190,6 +190,7 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    let mut records = Vec::new();
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
@@ -201,18 +202,41 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // Vice-Tay clips dirty ranges to the slots the GPU can mirror.
+        // Overflow records remain in title memory for table lookups.
+        let mirrored_count = heap.desc.count.min(host.count());
         for (from, to) in written.take(start as usize, usize::MAX) {
+            let first = (from as u64 - start) / step;
+            let last = (to as u64 - start).div_ceil(step).min(u64::from(heap.desc.count));
+            let overflow = first.max(u64::from(mirrored_count));
+            if overflow < last {
+                host::note_overflow_range(overflow as u32, last as u32, mirrored_count);
+            }
+            let to = to.min((start + u64::from(mirrored_count) * step) as usize);
+            if from >= to {
+                continue;
+            }
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                let end = (page + page_size).min(to);
+                let page = page.max(from);
+                let first = (page as u64 - start) / step;
+                let last = (end as u64 - start).div_ceil(step);
+                if first >= last {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
+                let address = start + first * step;
+                let size = ((last - first) * step) as usize;
+                records.resize(size, 0);
+                // A console page can contain several Windows mappings.
+                // Copy into scratch so holes become empty slots and a
+                // decommit during mirroring cannot invalidate the reads.
+                crate::host::copy_mapped(records.as_mut_ptr(), address as *const u8, size, false);
+                for (offset, slot) in records.chunks_exact(step as usize).enumerate() {
+                    let word = |i| u32::from_le_bytes(slot[i..i + 4].try_into().unwrap());
+                    host.mirror_record(first as u32 + offset as u32, [word(0), word(4), word(8)], false);
                 }
             }
         }
@@ -305,7 +329,7 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -532,6 +556,52 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Placed views stay in the descriptor table for the run. Ignore padding and
+/// unused union fields when recording them so the same view can be reused.
+/// Adapted from Vice-Tay f07e54a and ce91490.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut result = [0; 14];
+    // SAFETY: The title supplied a resource description. Words 1 and 13
+    // are padding. Dimension is word 0 and Alignment through Flags are 2..13.
+    unsafe {
+        result[0] = src.read_unaligned();
+        result[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(result)
+}
+
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    if desc.is_null() {
+        return None;
+    }
+    // Number of live union words by D3D12 SRV or UAV dimension. Keep the
+    // original description for dimensions whose layout we do not know.
+    const SRV: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+    const UAV: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+    let src = desc.cast::<u32>();
+    // SAFETY: Dimension is the second word of either live description.
+    let dimension = unsafe { src.add(1).read_unaligned() } as usize;
+    let (header, start, sizes) = if unordered {
+        (2, 2, &UAV[..])
+    } else {
+        (3, 4, &SRV[..])
+    };
+    let Some(&used) = sizes.get(dimension).filter(|_| dimension != 0) else {
+        return words(desc);
+    };
+    let mut result = [0; 16];
+    // SAFETY: Each index is a field of the supplied description, including
+    // the console address and flags after the standard D3D12 view.
+    for index in (0..header).chain(start..start + used).chain(10..16) {
+        result[index] = unsafe { src.add(index).read_unaligned() };
+    }
+    Some(result)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -541,7 +611,9 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) =
+        (placed_resource_words(resource), placed_view_words(desc, false))
+    {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -552,7 +624,9 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) =
+        (placed_resource_words(resource), placed_view_words(desc, true))
+    {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -881,14 +955,14 @@ mod tests {
         let memory = crate::watch::tests::pool(1);
         let desc = HeapDesc {
             kind: SAMPLERS,
-            count: 64,
+            count: 512,
             flags: SHADER_VISIBLE,
             nodes: 1,
         };
         let mut h = std::ptr::null();
         let placement = Placement {
             address: memory as u64,
-            size: 64 * 16,
+            size: 512 * 16,
         };
         assert_eq!(create(desc, placement, &mut h), S_OK);
         if let Some(host) = heap(h).host() {
@@ -896,13 +970,21 @@ mod tests {
             let mut elsewhere = [0u64; 2];
             let at = elsewhere.as_mut_ptr() as u64;
             create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
-            let slot = memory as u64 + 5 * 16;
+            // Use a slot on the second Windows page in one console page.
+            let slot = memory as u64 + 261 * 16;
             // SAFETY: 16 bytes of each, ours; the heap's page is guarded
             // (our handler opens it).
             unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot as *mut u8, 16) };
-            assert!(!host.made(5));
+            assert!(!host.made(261));
             sync_heaps();
-            assert!(host.made(5), "made at the sync");
+            assert!(host.made(261), "made at the sync");
+
+            use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+            // SAFETY: the fixture owns this page in the reserved heap.
+            assert_ne!(unsafe { VirtualFree((memory + 4096) as *mut _, 4096, MEM_DECOMMIT) }, 0);
+            crate::watch::title_memory_remapped(memory + 4096, 4096);
+            sync_heaps();
+            assert!(!host.made(261), "a decommitted descriptor is cleared");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
@@ -937,5 +1019,36 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn placed_views_reuse_descriptors_when_padding_differs() {
+        let resource = [1, 0, 0, 0, 0x4000, 0, 1, 0x10001, 0, 1, 0, 1, 0, 0];
+        let srv = [0, 1, 0x1688, 0, 16, 0, 64, 16, 0, 0, 0x1000, 6, 0, 0, 0, 0];
+        let uav = [0, 1, 16, 0, 64, 16, 0, 0, 0, 0, 0x1000, 6, 0, 0, 0, 0];
+        for (unordered, create, desc) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _), srv),
+            (true, create_placed_uav, uav),
+        ] {
+            let mut slot = [0u32; 8];
+            let handle = slot.as_mut_ptr() as u64;
+            create(std::ptr::null(), &resource, &desc, handle);
+            let first = slot;
+            let mut padded_resource = resource;
+            padded_resource[1] = 0xaaaa_aaaa;
+            padded_resource[13] = 0xbbbb_bbbb;
+            let mut padded_view = desc;
+            padded_view[9] = 0xcccc_cccc;
+            if !unordered {
+                padded_view[3] = 0xdddd_dddd;
+            }
+            create(std::ptr::null(), &padded_resource, &padded_view, handle);
+            assert_eq!(slot, first);
+            assert_eq!(view(handle), Some(View::Placed(unordered, resource, desc)));
+
+            padded_view[10] += 0x1000;
+            create(std::ptr::null(), &padded_resource, &padded_view, handle);
+            assert_ne!(slot, first);
+        }
     }
 }

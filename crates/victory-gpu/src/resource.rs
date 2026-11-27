@@ -237,6 +237,67 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The uses the host device supports for a format.
+#[cfg(windows)]
+pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static KNOWN: std::sync::Mutex<Vec<(u32, D3D12_FORMAT_SUPPORT1)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, flags)) = known.iter().find(|(f, _)| *f == format) {
+        return flags;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = crate::host::host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+    });
+    let flags = if ok { support.Support1 } else { D3D12_FORMAT_SUPPORT1_NONE };
+    known.push((format, flags));
+    flags
+}
+
+/// Use a writable format with comparable precision and range for packed targets.
+#[cfg(windows)]
+pub(crate) fn target_format(format: u32) -> u32 {
+    packed_target_format(format, format_support)
+}
+
+#[cfg(windows)]
+fn packed_target_format(
+    format: u32,
+    support: impl FnOnce(u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1,
+) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+    expanded_format(format)
+        .filter(|_| !support(format).contains(both))
+        .unwrap_or(format)
+}
+
+/// Host formats for expanded BGRA16 and shared-exponent HDR texels.
+pub(crate) fn expanded_format(guest: u32) -> Option<u32> {
+    match guest {
+        86 | 115 => Some(28), // RGBA8
+        67 => Some(10),      // RGBA16F
+        _ => None,
+    }
+}
+
+fn stand_in_format(guest: u32, host: u32) -> bool {
+    expanded_format(guest) == Some(host)
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -280,11 +341,17 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    (format != own && !stand_in_format(own, format)).then_some(own)
+}
+
+/// The packed format of a live expanded texture.
+#[cfg(windows)]
+pub(crate) fn packed_format(this: This) -> Option<u32> {
+    host_copy(this)?.packed()
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -776,6 +843,7 @@ pub(crate) struct HostTexture {
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
     pub(crate) castable: Vec<u32>,
+    packed_guest: Option<u32>,
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
@@ -792,6 +860,11 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    /// The guest format when this texture holds expanded texels.
+    pub(crate) fn packed(&self) -> Option<u32> {
+        self.packed_guest
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -808,6 +881,7 @@ impl HostTexture {
             texture,
             state: state.into(),
             castable,
+            packed_guest: None,
             host_written: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
@@ -988,6 +1062,14 @@ pub(crate) fn host_resource<'a>(
     resource(this).host_texture().map(|h| &h.texture)
 }
 
+/// Check a resource pointer read out of optional retail ABI data.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -1017,6 +1099,9 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    if d.flags & (TARGET | UNORDERED) != 0 {
+        d.format = target_format(d.format);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1031,6 +1116,8 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
+#[cfg(windows)]
+const TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
@@ -1054,6 +1141,8 @@ pub(crate) struct MemoryKey {
     swizzle: u32,
     element: (u64, u64),
     depth: bool,
+    #[cfg(windows)]
+    packed: Option<u32>,
 }
 
 /// The texture memory `desc` describes at `address`; `None` for buffers
@@ -1073,6 +1162,11 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
         swizzle: texture_layout(desc).map_or(desc.layout, |t| t.planes[0].layout.desc.swizzle.0),
         element: element(desc.format)?,
         depth: desc.flags & DEPTH != 0,
+        // A sampled RGB9E5 alias of an R32_UINT writer uses the original
+        // packed bits. An expanded RGB9E5 writer has a separate key.
+        #[cfg(windows)]
+        packed: ((desc.format != 67 || desc.flags & (TARGET | UNORDERED) != 0)
+            && target_format(desc.format) != desc.format).then_some(desc.format),
     })
 }
 
@@ -1114,6 +1208,12 @@ fn shared_texture(
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
+    if let Some(key) = key
+        && d.format == 67 && key.packed.is_none()
+        && let Some(expanded) = map.get(&MemoryKey { packed: Some(67), ..key }).and_then(std::sync::Weak::upgrade)
+    {
+        return Some(expanded);
+    }
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
         && takes(t, &d)
@@ -1129,7 +1229,10 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    let mut t = make_texture(&d, state, clear)?;
+    t.packed_guest = key.and_then(|key| key.packed)
+        .filter(|&format| stand_in_format(format, d.format));
+    let t = std::sync::Arc::new(t);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1153,6 +1256,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
+            || (stand_in_format(d.format, own) && target_format(d.format) == own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
 
@@ -1166,7 +1270,14 @@ fn current(this: This) -> bool {
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
-        .and_then(|m| m.get(&k)?.upgrade())
+        .and_then(|m| {
+            if r.desc.format == 67 && k.packed.is_none()
+                && let Some(expanded) = m.get(&MemoryKey { packed: Some(67), ..k }).and_then(std::sync::Weak::upgrade)
+            {
+                return Some(expanded);
+            }
+            m.get(&k)?.upgrade()
+        })
         .is_none_or(|live| std::sync::Arc::ptr_eq(&live, h))
 }
 
@@ -1185,6 +1296,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
+        if stand_in_format(value[0], d.format) {
+            value[0] = d.format;
+        }
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -1892,6 +2006,57 @@ mod tests {
     fn a_null_view_has_no_alias_source() {
         assert!(alias_source(std::ptr::null()).is_none());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_targets_require_both_writable_uses() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let rt = D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+        let uav = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+        for (format, expanded) in [(86, 28), (115, 28), (67, 10)] {
+            for support in [D3D12_FORMAT_SUPPORT1_NONE, rt, uav] {
+                assert_eq!(packed_target_format(format, |_| support), expanded);
+            }
+            assert_eq!(packed_target_format(format, |_| rt | uav), format);
+        }
+        for format in [28, 85, 87] {
+            assert_eq!(packed_target_format(format, |_| unreachable!()), format);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_textures_keep_the_guest_layout_until_writable() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        for format in [86, 115, 67] {
+            let guest = texture(16, 16, format, 1);
+            assert_eq!(host_desc(&guest).unwrap().format, format);
+            for flags in [TARGET, UNORDERED, TARGET | UNORDERED] {
+                let d = host_desc(&ResourceDesc { flags, ..guest }).unwrap();
+                assert_eq!(d.format, target_format(format));
+                let clear = [format, 0, 0, 0, 0];
+                let clear = if flags & TARGET != 0 { clear.as_ptr().cast() } else { std::ptr::null() };
+                let host = make_texture(&d, 0, clear).expect("a writable host texture");
+                // SAFETY: a live texture.
+                let made = unsafe { host.texture.GetDesc() };
+                assert_eq!(made.Format.0 as u32, d.format);
+                assert_eq!(made.Flags.0 as u32 & flags, flags);
+            }
+        }
+    }
+
+    #[test]
+    fn only_expanded_packed_texels_use_the_stand_in() {
+        for format in [86, 115] {
+            assert!(stand_in_format(format, 28));
+            assert!(!stand_in_format(format, format));
+        }
+        assert!(!stand_in_format(28, 28));
+        assert!(!stand_in_format(29, 27));
+    }
+
     use crate::object::slot;
 
     #[test]

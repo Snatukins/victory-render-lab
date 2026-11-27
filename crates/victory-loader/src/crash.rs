@@ -45,6 +45,111 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
 }
 
+/// Opt-in read-only probes, matched to faulting instruction addresses.
+#[cfg(feature = "diagnostics")]
+pub struct CrashChain {
+    pub instruction: usize,
+    pub root: CrashRoot,
+    pub offsets: Vec<usize>,
+}
+
+#[cfg(feature = "diagnostics")]
+pub enum CrashRoot {
+    Rdi,
+    Rdx,
+    Rcx,
+    /// Mode 1 pool lookup: RSI is the object and RCX is its pool.
+    PoolEntry,
+}
+
+#[cfg(feature = "diagnostics")]
+struct CrashProbes {
+    chains: Vec<CrashChain>,
+    aliases: fn(usize) -> Vec<usize>,
+}
+
+#[cfg(feature = "diagnostics")]
+static CRASH_PROBES: std::sync::OnceLock<CrashProbes> = std::sync::OnceLock::new();
+
+#[cfg(feature = "diagnostics")]
+pub fn trace_pointer_chains_on_crash(chains: Vec<CrashChain>, aliases: fn(usize) -> Vec<usize>) {
+    let _ = CRASH_PROBES.set(CrashProbes { chains, aliases });
+}
+
+#[cfg(feature = "diagnostics")]
+fn crash_read<const N: usize>(at: usize) -> Option<[u8; N]> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut value = [0; N];
+    let mut read = 0;
+    // SAFETY: the kernel checks the source, and the local destination has N bytes.
+    let ok = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), at as *const _, value.as_mut_ptr().cast(), N, &mut read)
+    };
+    (ok != 0 && read == N).then_some(value)
+}
+
+#[cfg(feature = "diagnostics")]
+fn pool_lookup_entry(context: &CONTEXT) -> Option<usize> {
+    let object = context.Rsi as usize;
+    let pool = context.Rcx as usize;
+    let [flags] = crash_read(object.checked_add(0x84)?)?;
+    if flags & 7 != 1 {
+        return None;
+    }
+    let slot = u32::from_le_bytes(crash_read(object.checked_add(0x58)?)?) & 0x3f_ffff;
+    if slot == 0x3f_ffff {
+        return None;
+    }
+    let start = usize::from_le_bytes(crash_read(pool.checked_add(0x38)?)?);
+    let stride = u32::from_le_bytes(crash_read(pool.checked_add(0x40)?)?);
+    let entry = start.checked_add(stride.checked_mul(slot)? as usize)?;
+    let object_data = usize::from_le_bytes(crash_read(entry)?);
+    (object_data != 0).then_some(object_data)
+}
+
+#[cfg(feature = "diagnostics")]
+fn report_pointer_chain(instruction: usize, context: &CONTEXT, mut line: impl FnMut(String)) {
+    let Some(probes) = CRASH_PROBES.get() else { return };
+    for probe in probes.chains.iter().filter(|probe| probe.instruction == instruction) {
+        report_chain(probe, probes.aliases, context, &mut line);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn report_chain(
+    probe: &CrashChain,
+    aliases: fn(usize) -> Vec<usize>,
+    context: &CONTEXT,
+    mut line: impl FnMut(String),
+) {
+    let mut base = match probe.root {
+        CrashRoot::Rdi => context.Rdi as usize,
+        CrashRoot::Rdx => context.Rdx as usize,
+        CrashRoot::Rcx => context.Rcx as usize,
+        CrashRoot::PoolEntry => {
+            let Some(base) = pool_lookup_entry(context) else {
+                line("  crash pointer chain pool entry unavailable".into());
+                return;
+            };
+            base
+        }
+    };
+    for &offset in probe.offsets.iter().take(4) {
+        let Some(at) = base.checked_add(offset) else { break };
+        let Some(bytes) = crash_read(at) else {
+            line(format!("  crash pointer chain [{at:#x}] unreadable"));
+            break;
+        };
+        let value = usize::from_le_bytes(bytes);
+        line(format!("  crash pointer chain [{at:#x}] = {value:#x}"));
+        for alias in aliases(at) {
+            line(format!("  crash pointer chain alias [{at:#x}] = [{alias:#x}]"));
+        }
+        base = value;
+    }
+}
+
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -673,6 +778,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_ACCESS_VIOLATION {
+        report_pointer_chain(at, context, &mut line);
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }

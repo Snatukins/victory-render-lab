@@ -54,6 +54,7 @@ struct Inner {
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), while no
     /// range is added or dropped: every list running heap shaders asks.
     hulls: Option<Vec<Hull>>,
+    revision: u64,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
@@ -90,6 +91,7 @@ impl Inner {
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
                     self.hulls = None;
+                    self.revision = self.revision.wrapping_add(1);
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
@@ -130,10 +132,19 @@ impl Viewed {
 
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
+    #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
+        self.changed_ranges(None).expect("no previously seen revision").1
+    }
+
+    fn changed_ranges(&self, previous: Option<u64>) -> Option<(u64, Vec<Hull>)> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let revision = inner.revision;
+        if previous == Some(revision) {
+            return None;
+        }
         if let Some(hulls) = &inner.hulls {
-            return hulls.clone();
+            return Some((revision, hulls.clone()));
         }
         let hulls: Vec<Hull> = inner
             .ends
@@ -144,7 +155,7 @@ impl Viewed {
             })
             .collect();
         inner.hulls = Some(hulls.clone());
-        hulls
+        Some((revision, hulls))
     }
 }
 
@@ -153,9 +164,10 @@ fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, _) = view
-        && let Some(texture) = crate::resource::host_resource(*resource as This)
+        && let Some(texture) = crate::resource::host_copy(*resource as This)
+        && crate::texture::title_written(&texture.texture)
     {
-        return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
+        return Some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -187,8 +199,8 @@ fn left_kind(view: &View) -> usize {
 /// memory changed copied into their host textures by a list of ours, which
 /// the submission runs first (and leaves them readable by shaders).
 ///
-/// shortcut: a title copy into texture memory recorded in the same
-/// submission shows from the next one on.
+/// Submission preparation calls this after running deferred title copies,
+/// so the GPU's first use sees what those copies wrote.
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -241,21 +253,18 @@ impl Uploads {
     }
 }
 
-/// Per submission: brings the buffer ranges a heap's views reach up to date
-/// (in the submission's batch of refreshes): the pages the title changed
-/// since their copies took them.
-///
-/// shortcut: what shaders write through the heap's unordered access views
-/// stays in the host copies (later draws read it there) and does not go
-/// back to title memory, so the CPU does not see it, and a page the title
-/// also writes is copied over from title memory, losing the GPU's bytes
-/// there. Copying back the whole unordered ranges after every submission
-/// (about 1 GB of them in the world) cost seconds per frame; the upgrade
-/// is shaders marking the pages they write (as `crate::memory` does).
-pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize, bool)) {
-    for (shadow, address, len, uav) in viewed.ranges() {
+/// Visits the ranges a heap's buffer views reach when they differ from
+/// the ranges already prepared for this submission.
+pub(crate) fn refresh(
+    viewed: &Viewed,
+    previous: Option<u64>,
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize, bool),
+) -> Option<u64> {
+    let (revision, ranges) = viewed.changed_ranges(previous)?;
+    for (shadow, address, len, uav) in ranges {
         add(&shadow, address as usize, len as usize, uav);
     }
+    Some(revision)
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them
@@ -494,9 +503,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
         set(0, Some((0x100, 0x100)));
         set(1, Some((0x800, 0x200)));
+        let revision = viewed.changed_ranges(None).unwrap().0;
         set(2, Some((0x100, 0x100)));
+        assert!(viewed.changed_ranges(Some(revision)).is_none());
         assert_eq!(hull(), [(0x100, 0x900)]);
         set(1, None);
+        assert!(viewed.changed_ranges(Some(revision)).is_some());
         assert_eq!(hull(), [(0x100, 0x100)], "the far range gone");
         set(0, None);
         assert_eq!(hull(), [(0x100, 0x100)], "one slot still views it");
@@ -529,7 +541,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes(tex_bytes.cast_mut(), texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        rounds(src, dst, tex, |_, base, texel| write(base, texel));
     }
 
     /// The same with the buffer and the texture in one view of physical
@@ -553,7 +565,28 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes((b + PAGE_BYTES) as *mut u8, texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        rounds(src, dst, tex, |_, base, texel| write(base, texel));
+    }
+
+    #[test]
+    fn heap_texture_sees_a_deferred_copy_in_the_same_submission() {
+        let src = resource(1, 256, 1, 0, 1);
+        let dst = resource(1, 256, 1, 0, 1);
+        let tex = resource(3, 4, 1, 28, LINEAR);
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (tex_bytes, tex_desc) = crate::resource::texture_memory(tex).unwrap();
+        let layout = crate::resource::texture_layout(&tex_desc).unwrap();
+        let size = layout.planes[0].layout.size as usize;
+        let uploads = [0x40, 0x10, 0x22].map(|texel| vec![texel; size]);
+        rounds(src, dst, tex, |list, base, texel| {
+            // SAFETY: the fixture owns a live 256-byte buffer.
+            let words = unsafe { std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64) };
+            for (i, word) in words.iter_mut().enumerate() {
+                *word = base + i as u32;
+            }
+            let bytes = uploads.iter().find(|bytes| bytes[0] == texel).unwrap();
+            list.defer_copy(tex_bytes.cast_mut(), bytes.as_ptr(), bytes.len());
+        });
     }
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
@@ -561,7 +594,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
     /// slot 1, let the title `write` (after recording, before submitting),
     /// submit, check the output's host copy.
-    fn rounds(src: This, dst: This, tex: This, write: impl Fn(u32, u8)) {
+    fn rounds(src: This, dst: This, tex: This, write: impl Fn(&HostList, u32, u8)) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -605,8 +638,18 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.defer_heap(&heap_host.viewed, true);
             list.close();
             // The title writes after recording, before submitting.
-            write(base, texel);
-            host.execute(&[&list]);
+            write(&list, base, texel);
+            if round == 1 {
+                let later = host.new_list().unwrap();
+                let native = crate::resource::host_resource(tex).unwrap();
+                crate::texture::upload(&later, tex, native);
+                later.close();
+                // The earlier dispatch needs fresh pixels before this
+                // explicit upload's GPU copy runs.
+                host.execute(&[&list, &later]);
+            } else {
+                host.execute(&[&list]);
+            }
             let words = out.read_host(dst_bytes as u64, 64);
             for (i, &v) in words.iter().enumerate() {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");

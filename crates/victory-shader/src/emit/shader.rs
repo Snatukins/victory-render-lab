@@ -106,12 +106,16 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil ([`super::lower::early_depth`]).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -189,6 +193,7 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    compute_derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -252,6 +257,7 @@ impl Shader {
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            compute_derivatives: false,
             lds_dwords: 0,
             lds: None,
             scan: None,
@@ -324,6 +330,13 @@ impl Shader {
         result
     }
 
+    /// More thread-group shared memory beside [`Shader::lds`]: `[dwords x
+    /// i32]` in address space 3, named `name`.
+    pub fn shared(&mut self, name: &str, dwords: u32) -> V {
+        let arr = self.m.array(dwords, self.t.i32);
+        self.m.global(name, arr, 3)
+    }
+
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
         &mut self,
@@ -334,6 +347,10 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Body calls are emitted even when their result is unused.
+        self.compute_derivatives |= self.threads.is_some()
+            && self.mesh.is_none()
+            && matches!(opcode, 60 | 61 | 64 | 81 | 83..=86);
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -714,6 +731,14 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        let declares_uav =
+            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
+        // Vertex, geometry and mesh shaders need the extra capability bit
+        // when declaring UAVs, including the internal write-tracking buffers.
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        if declares_uav && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -829,7 +854,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() {
+            if declares_uav {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -966,6 +991,9 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        if self.pixel && self.inputs.iter().any(|e| e.kind == 28) {
+            self.flags |= flags::BARYCENTRICS;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -1027,7 +1055,14 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let validator18 = compute && self.compute_derivatives;
+        let validator = if validator18 {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![validator]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -1052,6 +1087,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -1066,6 +1104,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
@@ -1098,6 +1139,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            validator18,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
@@ -1175,5 +1217,35 @@ mod heap_bounds_tests {
             null_offset((11, 0), false),
             null_offset((11 | 0x1000, 0), false)
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn compute_derivatives_validate_with_live_and_unused_results() {
+    use super::bitcode::Term;
+    use super::validator::Validator;
+
+    let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) else {
+        return;
+    };
+    for result_is_used in [false, true] {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        let block = s.entry;
+        let zero = s.m.f32(0);
+        let slope = s.op(block, "unary.f32", Attr::ReadNone, s.t.f32, 83, &[zero]);
+        if result_is_used {
+            let positive = s.m.cmp(block, pred::OGT, slope, zero);
+            let yes = s.m.new_block();
+            let no = s.m.new_block();
+            s.m.terminate(block, Term::CondBr(positive, yes, no));
+            s.m.terminate(yes, Term::Ret);
+            s.m.terminate(no, Term::Ret);
+        } else {
+            s.m.terminate(block, Term::Ret);
+        }
+        assert!(s.compute_derivatives);
+        validator.validate(&mut s.finish()).unwrap();
     }
 }

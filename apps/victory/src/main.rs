@@ -15,6 +15,16 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+fn pipeline_cache_dir(config: &victory_core::Config) -> Result<PathBuf> {
+    let Some(path) = std::env::var_os("VICTORY_PIPELINE_CACHE_DIR").filter(|path| !path.is_empty()) else {
+        return config.cache_subdir("pipelines");
+    };
+    let path = PathBuf::from(path);
+    victory_core::policy::ensure_outside_repo(&path)?;
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
 #[derive(Parser)]
 #[command(
     name = "victory",

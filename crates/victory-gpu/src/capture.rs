@@ -18,8 +18,8 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level. `VICTORY_CAPTURE_WORLD`
-/// lists frames counted from the first one that ran 500 draws (the world's
-/// first, whose number depends on how fast the title loaded).
+/// lists frames counted from the first one with 500 host draws or indirect
+/// requests, including requests whose pipelines were unavailable.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
@@ -40,24 +40,35 @@ fn world_offsets() -> &'static [u64] {
     OFFSETS.get_or_init(|| numbers("VICTORY_CAPTURE_WORLD"))
 }
 
-/// The first frame that ran 500 draws on the host.
+/// The first frame with substantial world rendering work.
 static WORLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static INDIRECT_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_indirect_request() {
+    if folder().is_some() && WORLD.get().is_none() && !world_offsets().is_empty() {
+        INDIRECT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Frame `n` was presented: notes the world's first frame.
 pub(crate) fn presented(n: u64) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    if folder().is_none() || WORLD.get().is_some() || world_offsets().is_empty() {
+        return;
+    }
     static LAST: AtomicU64 = AtomicU64::new(0);
     let drawn = crate::draw::drawn();
     let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
-    if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
+    let indirect = INDIRECT_REQUESTS.swap(0, Relaxed);
+    if draws >= 500 || indirect >= 500 {
         let _ = WORLD.set(n);
-        tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
+        tracing::info!(frame = n, draws, indirect, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
     }
 }
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && ((!compact() && n.is_power_of_two()) || listed(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -217,7 +228,7 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
+        let len = buffer.GetDesc().Width as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -288,6 +299,12 @@ pub(crate) fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
+/// Bound capture cost by keeping only frame-end images of scene-sized targets.
+pub(crate) fn compact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dump_on() && crate::switch::on("VICTORY_CAPTURE_COMPACT"))
+}
+
 /// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
 static WRITERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
@@ -306,7 +323,9 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
     }
     let by = WRITER.with(|w| w.borrow().clone());
     // Lists are recorded ahead of the frame that submits them.
-    list.note_target(resource as usize, &by);
+    if !compact() {
+        list.note_target(resource as usize, &by);
+    }
     if !listed(crate::queue::presented() + 1) {
         let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         let writers = writers.get_or_insert_with(|| {
@@ -328,6 +347,11 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
         }
     }
     keep_target(resource, by);
+}
+
+/// Record the pipeline that actually draws into this attachment.
+pub(crate) fn note_render_output(resource: crate::object::This, pipeline: &str) {
+    keep_target(resource, pipeline.to_owned());
 }
 
 fn keep_target(resource: crate::object::This, by: String) {
@@ -381,12 +405,25 @@ pub(crate) fn dump_targets(frame: u64) {
         );
     }
     let Some(host) = crate::host::host() else { return };
+    let compact = compact();
+    let mut inspected = 0;
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
+        }
+        if compact {
+            if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                || d.DepthOrArraySize != 1 || d.Width < 960 || d.Height < 500
+            {
+                continue;
+            }
+            if inspected >= 16 {
+                break;
+            }
+            inspected += 1;
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
@@ -592,10 +629,12 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
         // Tiny targets (exposure, averages): their values as they are.
-        if f.Width * f.Height <= 16 {
-            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
+        if f.Width * f.Height <= 16
+            && let Some((bytes, 1)) = crate::resource::element(f.Format.0 as u32)
+        {
+            let texel = bytes as usize;
             let words: Vec<String> = (0..f.Height as usize)
                 .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
                 .map(|c| {

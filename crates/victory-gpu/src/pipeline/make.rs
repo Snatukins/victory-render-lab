@@ -98,6 +98,7 @@ impl Work {
 
 pub(crate) fn note_commit_headroom(available: usize) {
     COMMIT_HEADROOM.store(available as u64, Ordering::Relaxed);
+    crate::shadow::note_window_commit(available);
 }
 
 /// Frames can be seconds apart while the title loads. Workers also sample
@@ -152,7 +153,7 @@ impl Pending {
             out_of_memory = code == windows::Win32::Foundation::E_OUTOFMEMORY;
         });
         #[cfg(feature = "diagnostics")]
-        log_built(&self.key);
+        log_built(&self.key, made.is_some());
         let (user, kernel) = super::thread_cpu_since(cpu);
         tracing::debug!(
             shaders = ?self.shaders,
@@ -244,8 +245,10 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Logs the library name of the host pipeline this thread just made or
 /// loaded for `key` (diagnostics).
 #[cfg(feature = "diagnostics")]
-pub(crate) fn log_built(key: &str) {
-    if let Some((name, loaded)) = super::library::LAST.take() {
+pub(crate) fn log_built(key: &str, succeeded: bool) {
+    if let Some((name, loaded)) = super::library::LAST.take()
+        && succeeded
+    {
         log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
     }
 }

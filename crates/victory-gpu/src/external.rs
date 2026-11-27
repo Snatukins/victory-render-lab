@@ -31,6 +31,11 @@ pub fn host_texture(
     Some((texture, state))
 }
 
+/// Marks a title texture updated by an external GPU writer.
+pub fn texture_written(resource: *const Object) {
+    crate::texture::host_written(resource);
+}
+
 /// Runs `f` with the host list behind the title list `list` (open for
 /// recording); `None` without one. What `f` binds (descriptor heaps, root
 /// signatures, pipeline) is replaced before the list's next draw or

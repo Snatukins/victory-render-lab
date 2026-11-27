@@ -1,7 +1,7 @@
 //! The host's FidelityFX through our entry points, called as Grand Theft
 //! Auto VI calls the console's: the title's descriptions, console objects,
 //! one upscaling of a flat colour, the output read back. Needs the PC build
-//! (`VICTORY_FIDELITYFX_DIR`) and a host GPU; skipped without them.
+//! (`VICTORY_FIDELITYFX_DIR`) or the DLSS adapter (`VICTORY_DLSS_DIR`), and a host GPU.
 #![cfg(windows)]
 
 use std::ffi::c_void;
@@ -157,10 +157,12 @@ fn half(bits: u16) -> f32 {
 
 #[test]
 fn the_titles_upscaler_runs_on_the_host() {
-    let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR") else {
-        eprintln!("VICTORY_FIDELITYFX_DIR not set; skipped");
+    let dlss = std::env::var_os("VICTORY_DLSS_DIR");
+    let fidelityfx = std::env::var_os("VICTORY_FIDELITYFX_DIR");
+    if dlss.is_none() && fidelityfx.is_none() {
+        eprintln!("set VICTORY_DLSS_DIR or VICTORY_FIDELITYFX_DIR to run this test");
         return;
-    };
+    }
     // The debug layer, before anything makes the host device: it checks
     // the states FidelityFX is told against the ones the list tracks.
     // SAFETY: plain calls; the layer may be missing.
@@ -170,7 +172,13 @@ fn the_titles_upscaler_runs_on_the_host() {
             debug.iter().for_each(|d| d.EnableDebugLayer());
         }
     }
-    victory_hle::modules::fidelityfx::use_host_dir(Some(std::path::Path::new(&dir)));
+    if let Some(dir) = &dlss {
+        victory_hle::modules::fidelityfx::use_dlss_dir(std::path::Path::new(dir)).unwrap();
+    } else {
+        victory_hle::modules::fidelityfx::use_host_dir(
+            fidelityfx.as_deref().map(std::path::Path::new),
+        );
+    }
     let Some(host) = victory_gpu::external::host_device() else {
         eprintln!("no host GPU; skipped");
         return;
@@ -293,7 +301,11 @@ fn the_titles_upscaler_runs_on_the_host() {
     let motion = at(render, DXGI_FORMAT_R16G16_FLOAT, target);
     let upscaled = at(
         output,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        if dlss.is_some() {
+            DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+        } else {
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        },
         target | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
     );
 
@@ -389,7 +401,9 @@ fn the_titles_upscaler_runs_on_the_host() {
         usage: &mut usage,
     };
     assert_eq!(query(&mut context, &mut memory.header), 0);
-    assert!(usage[0] > 0);
+    if dlss.is_none() {
+        assert!(usage[0] > 0);
+    }
 
     // Its dispatch: its resource descriptions (type, format, size, depth,
     // mips, flags, usage) in the states it gives (read 0xc, written 0x2).
@@ -447,6 +461,12 @@ fn the_titles_upscaler_runs_on_the_host() {
     eprintln!("provider {:#x} {:?}", provider.id, unsafe {
         std::ffi::CStr::from_ptr(provider.name)
     });
+    if dlss.is_some() {
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(provider.name) }.to_bytes(),
+            b"DLSS 4.5 (preset M)"
+        );
+    }
     // Two frames: the first resets the history.
     for reset in [1, 0] {
         upscaling.reset = reset;

@@ -71,6 +71,21 @@ impl std::fmt::Debug for Shader {
     }
 }
 
+/// Compute shaders from the title's console acceleration-structure builder.
+/// Its stages exchange data in title memory. A subset running on stale
+/// inputs can write beyond its own structures.
+#[cfg(windows)]
+static CONSOLE_BVH_SHADERS: OnceLock<std::collections::HashSet<blake3::Hash>> = OnceLock::new();
+
+/// Register the builder's containers before the title creates pipelines.
+#[cfg(windows)]
+pub fn register_console_bvh_shaders(shaders: std::collections::HashSet<blake3::Hash>) {
+    if !shaders.is_empty() {
+        tracing::info!(shaders = shaders.len(), "console BVH GPU stages disabled");
+        let _ = CONSOLE_BVH_SHADERS.set(shaders);
+    }
+}
+
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
@@ -205,6 +220,8 @@ struct Pipeline {
     shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
+    #[cfg(windows)]
+    console_builder: bool,
     /// What its host pipeline is made from, and the host pipeline once made
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
@@ -244,7 +261,11 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if p.console_builder {
+        return None;
+    }
+    make::ready(&p.host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -319,6 +340,7 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| p.console_builder.then(|| "console BVH builder disabled".to_owned()))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -366,12 +388,19 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    let console_builder = matches!(&shaders[..], [s] if s.stage == "compute"
+        && CONSOLE_BVH_SHADERS.get().is_some_and(|set| set.contains(&blake3::hash(&s.container))));
+    #[cfg(windows)]
+    if !console_builder {
+        make::early(&host);
+    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        console_builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -640,12 +669,14 @@ impl Prebuild {
         library::keep_early_list();
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
-        let quiet = tracing::Dispatch::none();
-        let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::build(&self.shaders, self.graphics.as_deref(), |_| {})
-        });
+        let build = || host::HostPipeline::build(&self.shaders, self.graphics.as_deref(), |_| {});
+        let made = if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG") {
+            build()
+        } else {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), build)
+        };
         #[cfg(feature = "diagnostics")]
-        make::log_built(&key);
+        make::log_built(&key, made.is_some());
         if made.is_some() {
             // shortcut: a pipeline the library refused to store is listed
             // too; a run then makes it at first use.

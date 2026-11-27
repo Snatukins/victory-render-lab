@@ -23,8 +23,7 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// Dynamic slots past `count`; sampler heaps have none.
     dynamic: u32,
     sampler: bool,
     pub(crate) bounds: HeapBounds,
@@ -65,6 +64,7 @@ pub(crate) struct HostHeap {
 
 struct MadeViews {
     title: Vec<u64>,
+    deferred: std::collections::HashSet<u32>,
     /// Addresses of temporary views created before the GPU table exists.
     pending_addresses: HashMap<u32, u64>,
 }
@@ -129,12 +129,20 @@ impl HeapBounds {
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        // On a capped heap a larger reserve can keep overflow tables and
+        // indirect draws running, at the cost of fewer directly indexed
+        // title slots (upstream #747).
+        let capped_dynamic = if !sampler && crate::switch::on("VICTORY_LARGE_DYNAMIC_HEAP") {
+            DYNAMIC
+        } else {
+            MIN_DYNAMIC
+        };
         Self::new_with_limits(
             sampler,
             count,
             Some(HEAP_VIEWS),
             PORTABLE_VIEWS,
-            [DYNAMIC, MIN_DYNAMIC],
+            [DYNAMIC, capped_dynamic],
             PAIR_SLOTS,
         )
     }
@@ -144,7 +152,7 @@ impl HostHeap {
         count: u32,
         preferred: Option<u32>,
         portable: u32,
-        [dynamic, min_dynamic]: [u32; 2],
+        [dynamic, capped_dynamic]: [u32; 2],
         pairs: u32,
     ) -> Option<Self> {
         let host = host()?;
@@ -178,12 +186,11 @@ impl HostHeap {
         {
             (heap, count, dynamic)
         } else {
-            let requested = count.saturating_add(min_dynamic + pairs + NULL_VIEWS);
+            let reserved = capped_dynamic.checked_add(pairs)?.checked_add(NULL_VIEWS)?;
+            let title_limit = portable.checked_sub(reserved)?;
+            let requested = count.saturating_add(reserved);
             match make(requested.min(portable)) {
-                Ok(heap) => {
-                    let count = count.min(portable.checked_sub(min_dynamic + pairs + NULL_VIEWS)?);
-                    (heap, count, min_dynamic)
-                }
+                Ok(heap) => (heap, count.min(title_limit), capped_dynamic),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -194,6 +201,7 @@ impl HostHeap {
             tracing::warn!(
                 requested_count,
                 count,
+                dynamic_slots = extra,
                 sampler,
                 "host descriptor heap capped"
             );
@@ -252,6 +260,7 @@ impl HostHeap {
             bounds,
             made: Mutex::new(MadeViews {
                 title: vec![0; count as usize],
+                deferred: Default::default(),
                 pending_addresses: HashMap::new(),
             }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -353,8 +362,16 @@ static HEAP_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
 static HEAP_OVERFLOW_MAX: AtomicU32 = AtomicU32::new(0);
 
 fn note_overflow(index: u32, count: u32, for_draw: bool) {
-    HEAP_OVERFLOW_MAX.fetch_max(index, Ordering::Relaxed);
-    HEAP_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
+    note_overflow_slots(index, index, 1, count, for_draw);
+}
+
+pub(super) fn note_overflow_range(first: u32, end: u32, count: u32) {
+    note_overflow_slots(first, end - 1, u64::from(end - first), count, false);
+}
+
+fn note_overflow_slots(index: u32, highest: u32, missed: u64, count: u32, for_draw: bool) {
+    HEAP_OVERFLOW_MAX.fetch_max(highest, Ordering::Relaxed);
+    HEAP_OVERFLOW_COUNT.fetch_add(missed, Ordering::Relaxed);
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| {
         tracing::warn!(index, count, for_draw, "title slot past the host heap");
@@ -809,7 +826,15 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, record, for_draw)
+    }
+
+    pub(crate) fn mirror_record(&self, index: u32, [tag, i, generation]: [u32; 3], for_draw: bool) -> Option<View> {
+        if index >= self.count {
+            note_overflow(index, self.count, for_draw);
+            return None;
+        }
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -819,12 +844,13 @@ impl HostHeap {
             // title released): nothing to read.
             if made.title[index as usize] != 0 {
                 made.title[index as usize] = 0;
+                made.deferred.remove(&index);
                 self.make_null(index);
                 self.note_address(index, None);
             }
             return None;
         };
-        if made.title[index as usize] != key {
+        if made.title[index as usize] != key || (for_draw && made.deferred.contains(&index)) {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -834,10 +860,12 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
-            made.title[index as usize] = if later { 0 } else { key };
+            made.title[index as usize] = key;
             let (kept, mark) = if later {
+                made.deferred.insert(index);
                 (None, None)
             } else {
+                made.deferred.remove(&index);
                 make_marked(&view, self.cpu(index))
             };
             self.set_mark(index, mark);
@@ -876,7 +904,8 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner()).title[index as usize] != 0
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.title[index as usize] != 0 && !made.deferred.contains(&index)
     }
 }
 
@@ -1172,7 +1201,13 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(
+    texture: &ID3D12Resource,
+    castable: &[u32],
+    packed: Option<u32>,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -1204,6 +1239,12 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
         return !typeless && (!unordered || typed_store(own));
+    }
+    if packed == Some(view) {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return !unordered || typed_store(own);
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
@@ -1240,29 +1281,7 @@ fn default_view(resource: crate::object::This) -> bool {
 
 /// Whether the host stores to typed unordered views of `format`.
 fn typed_store(format: u32) -> bool {
-    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
-    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
-        return ok;
-    }
-    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-        Format: DXGI_FORMAT(format as i32),
-        ..Default::default()
-    };
-    let ok = host().is_some_and(|h| {
-        // SAFETY: a plain query into a struct of its size.
-        unsafe {
-            h.device.CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_SUPPORT,
-                (&raw mut support).cast(),
-                size_of_val(&support) as u32,
-            )
-        }
-        .is_ok()
-            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
-    });
-    known.push((format, ok));
-    ok
+    crate::resource::format_support(format).contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
 }
 
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
@@ -1310,7 +1329,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
-                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(texture, &copy.castable, copy.packed(), desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -1351,7 +1370,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if desc.is_none() && !default_view(resource) {
                 return None;
             }
-            if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(texture, &copy.castable, copy.packed(), desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -1631,6 +1650,30 @@ mod tests {
         assert_eq!(heap.pair(), Some(2));
         assert_eq!(heap.dynamic(2), Some(4));
         assert_eq!(heap.dynamic(1), None);
+    }
+
+    #[test]
+    fn larger_capped_reserve_holds_two_tables_without_using_pair_or_null_slots() {
+        if host().is_none() {
+            return;
+        }
+        let total = 8 + NULL_VIEWS;
+        let small = HostHeap::new_with_limits(false, 4, None, total, [4, 2], 2).unwrap();
+        assert_eq!(small.count(), 4);
+        assert_eq!(small.dynamic(2), Some(4));
+        assert_eq!(small.dynamic(2), None);
+
+        let large = HostHeap::new_with_limits(false, 4, None, total, [4, 4], 2).unwrap();
+        assert_eq!(large.bounds.capacity, small.bounds.capacity);
+        assert_eq!(large.count(), 2);
+        assert_eq!(large.dynamic(2), Some(2));
+        assert_eq!(large.dynamic(2), Some(4));
+        assert_eq!(large.dynamic(1), None);
+        assert_eq!(large.pair(), Some(6));
+        assert_eq!(large.pair(), None);
+        assert_eq!(large.bounds.null_base, 8);
+        large.release(2, 2);
+        assert_eq!(large.dynamic(2), Some(2));
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

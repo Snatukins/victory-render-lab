@@ -2,7 +2,9 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it; a wave64 one on a
+//! host of 32-lane waves declares 32 and runs in halves
+//! ([`Options::wave64_split`], adapted from VIctory PR #2633).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -358,6 +360,8 @@ pub struct Options {
     pub wave64_group_collectives: bool,
     /// Broadcast the first active compute lane via a bitwise reduction.
     pub compute_wave_first_reduce: bool,
+    /// Translate supported Wave64 compute programs as pairs of Wave32 waves.
+    pub wave64_split: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -563,6 +567,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             8 => 2,
             9 => 13,
             10 => 12,
+            23 => 28, // barycentrics
             64 => 16,
             65 => 17,
             66 => 14,
@@ -1445,6 +1450,28 @@ mod tests {
         part
     }
 
+    #[test]
+    fn direct_center_barycentrics_are_an_unallocated_pixel_input() {
+        let words = [
+            0xF800_180Fu32,
+            0x0100_0100, // exp mrt0, v0, v1, v0, v1 done vm
+            0xBF81_0000,
+        ];
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let isg1 = rows(&[], true);
+        let out = emit_pixel(&words, vec![], 1 << 1, &isg1, &osg1).unwrap();
+        let host = Container::parse(&out.dxil).unwrap();
+        let features = host.part(FourCC::SFI0).unwrap().data;
+        assert_eq!(u64::from_le_bytes(features.try_into().unwrap()), 0x2_0000);
+        let input = host.part(FourCC::ISG1).unwrap().data;
+        let elements = signature(input).unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].name, "SV_Barycentrics");
+        assert_eq!(elements[0].row, None);
+        assert_eq!(input[8 + 25], 0b110, "I and J use weights 1 and 2");
+        assert!(emit_pixel(&words, vec![], 1, &isg1, &osg1).is_err());
+    }
+
     /// Attribute 0 in row 0, 16-bit (one value per dword) or not.
     fn texcoord(fp16: bool) -> crate::native::PsInput {
         crate::native::PsInput {
@@ -1620,7 +1647,7 @@ mod tests {
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
     #[cfg(windows)]
-    fn dump_dxil(container: &[u8]) -> Option<String> {
+    pub(super) fn dump_dxil(container: &[u8]) -> Option<String> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
@@ -1628,7 +1655,9 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!("victory-interp-{}-{n}.dxil", std::process::id()));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -1789,5 +1818,185 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+}
+
+#[cfg(test)]
+mod early_depth_tests {
+    use super::container::SigElement;
+    use crate::native::{HwStage, NativeProgram, StageIo};
+
+    /// (Scarlett, ported from RYUKI-7900XT) The early-depth flag follows DB_SHADER_CONTROL bit
+    /// 12, and never for a program that exports depth, stencil or coverage.
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = super::container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
+        assert_eq!(late, early, "early depth declared for a depth export");
+        let ps = |db| StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] };
+        assert!(super::lower::early_depth(&ps(0x1450), &[]));
+        assert!(super::lower::early_depth(&ps(0x1010), &[]));
+        assert!(!super::lower::early_depth(&ps(0x0450), &[]));
+        assert!(!super::lower::early_depth(&ps(0x1012), &[]));
+        assert!(!super::lower::early_depth(&ps(0x1150), &[]));
+        assert!(!super::lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
+        assert!(!super::lower::early_depth(&StageIo::None, &[]));
+    }
+}
+
+/// The DXIL `dxc -dumpbin` prints for small pixel programs, for the picture
+/// fixes ported from Scarlett that have no other way to be seen in a test.
+#[cfg(all(test, windows))]
+mod picture_fix_tests {
+    use super::container::SigElement;
+    use crate::native::{
+        HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+
+    /// `words`, a pixel program writing one float colour target, with a
+    /// table of one 8-dword view at s9, as `dxc -dumpbin` prints it (None
+    /// without dxc).
+    fn dumped(words: &[u32]) -> Option<String> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 9,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0x50, patches: vec![] },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let out = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[out], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let dxil = super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+        let text = super::tests::dump_dxil(&dxil);
+        if text.is_none() {
+            eprintln!("no dxc (VICTORY_PC_DXC); the DXIL was not looked at");
+        }
+        text
+    }
+
+    /// (Neptune 25fbf69, `VICTORY_NAN_GUARD`) A float colour export is
+    /// tested for NaN and infinity (exponent all ones, 0x7F800000) and an
+    /// infinity made +-65504 (0x477FE000); =0: exported as it is.
+    #[test]
+    fn a_float_colour_export_turns_nan_and_infinity_into_numbers() {
+        // A texel, not a constant: a guard of a constant is folded away.
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0xF000_1100,
+            0x0000_0D06, // image_load v13, v6, s[0:7] dmask:0x1
+            0xBF8C_0000, // s_waitcnt 0
+            0xF800_180F,
+            0x0D0D_0D0D, // exp mrt0 v13, v13, v13, v13 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let Some(text) = dumped(&words) else { return };
+        assert!(
+            text.contains("2139095040") && text.contains("1199562752"),
+            "no NaN guard on the colour export:\n{text}"
+        );
+    }
+
+    /// (Scarlett, `VICTORY_D16_BITS`) A d16 image load keeps the low 16 bits
+    /// of what an integer view returns (a value up to 0xFFFF, or from
+    /// 0xFFFF8000) instead of converting them as a float; =0: converted.
+    #[test]
+    fn a_d16_image_load_keeps_an_integer_views_bits() {
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0xF000_1100,
+            0x8000_0D06, // image_load v13, v6, s[0:7] dmask:0x1 d16
+            0xBF8C_0000, // s_waitcnt 0
+            0xF800_180F,
+            0x0D0D_0D0D, // exp mrt0 v13, v13, v13, v13 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let Some(text) = dumped(&words) else { return };
+        assert!(text.contains("legacyF32ToF16"), "the d16 load is not converted at all:\n{text}");
+        assert!(
+            text.contains("65535") && text.contains("-32769"),
+            "the d16 load's integer bits are converted as a float:\n{text}"
+        );
     }
 }
